@@ -4,3 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.97"
+axum = { version = "0.8.1", default-features = false, features = ["form", "http1", "http2", "matched-path", "multipart", "original-uri", "tokio", "tower-log", "tracing", "ws"] }
+bcrypt = "0.17.0"
+bytes = { version = "1.10.1", default-features = false }
+cookie = { version = "0.18.1", default-features = false, features = ["percent-encode"] }
+hyper = { version = "1.6.0", default-features = false }
+hyper-util = { version = "0.1.10", features = ["client", "client-legacy", "tokio"] }
+jsonwebtoken = { version = "9.3.1", default-features = false }
+rustc-hash = "2.1.1"
+serde = { version = "1.0.219", default-features = false }
+tokio = { version = "1.44.1", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
