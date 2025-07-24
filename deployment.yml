@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: passwall
+  labels:
+    app: passwall
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: passwall
+  template:
+    metadata:
+      labels:
+        app: passwall
+    spec:
+      volumes:
+        - name: config
+          configMap:
+            name: passwall-config
+            items:
+            - key: config
+              path: passwall.yaml
+      containers:
+      - name: passwall
+        image: localhost:5000/passwall
+        command:
+          - /app/pass-wall
+        args:
+          - --config
+          - /app/config/passwall.yaml
+        ports:
+        - containerPort: 3000
+        volumeMounts:
+          - name: config
+            mountPath: /app/config/
+        resources:
+          limits:
+            cpu: 10m
+            memory: 64Mi
+

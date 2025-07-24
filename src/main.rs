@@ -12,6 +12,7 @@ use axum::{
 };
 use bcrypt::DEFAULT_COST;
 use bytes::Bytes;
+use clap::Parser;
 use hyper::StatusCode;
 use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
 use jsonwebtoken::{
@@ -37,7 +38,7 @@ struct Claims {
 }
 
 /// Allowed user
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Deserialize)]
 struct User {
     name: String,
     // bcrypt
@@ -45,11 +46,71 @@ struct User {
 }
 
 /// Define who and what can be access and be accessed
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Policy {
     users: rustc_hash::FxHashMap<String, User>,
     authorized_hosts: rustc_hash::FxHashMap<User, Vec<String>>,
     endpoints: rustc_hash::FxHashMap<String, Uri>,
+}
+
+impl TryFrom<Config> for Policy {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Config) -> Result<Self, Self::Error> {
+        let mut users = rustc_hash::FxHashMap::<String, User>::default();
+        for user in &value.users {
+            users.insert(
+                user.name.clone(),
+                User {
+                    name: user.name.clone(),
+                    password_hash: user.password_hash.clone(),
+                },
+            );
+        }
+
+        let mut authorized_hosts = rustc_hash::FxHashMap::<User, Vec<String>>::default();
+        let mut endpoints = rustc_hash::FxHashMap::<String, Uri>::default();
+
+        for endpoint in value.endpoints {
+            for user_name in endpoint.allowed_users {
+                let user = match users.get(&user_name) {
+                    Some(u) => u,
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "The endpoint '{}' configuration specifies an inexistent user called '{}'",
+                            endpoint.domain,
+                            user_name
+                        ));
+                    }
+                };
+
+                if let Some(hosts) = authorized_hosts.get_mut(&user) {
+                    hosts.push(endpoint.domain.clone());
+                } else {
+                    authorized_hosts
+                        .insert(user.clone(), Vec::from_iter([endpoint.domain.clone()]));
+                }
+
+                let uri = Uri::try_from(endpoint.dest.clone())?;
+
+                if uri.scheme_str() != Some("http") && uri.scheme_str() != Some("https") {
+                    return Err(anyhow::anyhow!(
+                        "The endpoint '{}' specifies a destination '{}' that is neither 'http://' nor 'https://', and we only support these protocols. Please, add which protocol of the destination host",
+                        endpoint.domain,
+                        endpoint.dest,
+                    ));
+                }
+
+                endpoints.insert(endpoint.domain.clone(), uri);
+            }
+        }
+
+        Ok(Policy {
+            users,
+            authorized_hosts,
+            endpoints,
+        })
+    }
 }
 
 /// All static pages
@@ -77,6 +138,21 @@ struct LoginInput {
     password: String,
 }
 
+#[derive(Deserialize, Clone, Debug)]
+struct Endpoint {
+    domain: String,
+    dest: String,
+    allowed_users: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Config {
+    app_bind: String,
+    app_key: String,
+    users: Vec<User>,
+    endpoints: Vec<Endpoint>,
+}
+
 /// Local app error
 struct AppError(anyhow::Error);
 
@@ -97,6 +173,13 @@ where
     }
 }
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, default_value = "passwall.yaml")]
+    config: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt::Subscriber::builder()
@@ -109,26 +192,20 @@ async fn main() -> Result<(), anyhow::Error> {
         hyper_util::client::legacy::Client::<(), ()>::builder(TokioExecutor::new())
             .build(HttpConnector::new());
 
-    let secret = b"secret";
+    let args = Args::parse();
+    let app_config: Config = serde_yaml_ng::from_slice(&fs::read(args.config)?)?;
+
     let static_pages = StaticPages {
         login: Bytes::from_owner(fs::read("./static/login.html")?),
         login_failed: Bytes::from_owner(fs::read("./static/login_failed.html")?),
         unauthorized: Bytes::from_owner(fs::read("./static/unauthorized.html")?),
     };
 
-    let user = User {
-        name: String::from("admin"),
-        password_hash: bcrypt::hash("password", DEFAULT_COST)?,
-    };
+    let policy = Policy::try_from(app_config.clone())?;
 
-    let policy = Policy {
-        users: FxHashMap::from_iter([(user.name.clone(), user.clone())]),
-        authorized_hosts: FxHashMap::from_iter([(user, vec![String::from("my.host.com:3000")])]),
-        endpoints: FxHashMap::from_iter([(
-            String::from("my.host.com:3000"),
-            Uri::try_from("http://127.0.0.1:8080")?,
-        )]),
-    };
+    tracing::debug!(?policy, "runtime policy");
+
+    let app_key_bytes = app_config.app_key.into_bytes();
 
     let app = Router::new()
         .route(
@@ -140,11 +217,11 @@ async fn main() -> Result<(), anyhow::Error> {
             http_client,
             policy,
             static_pages,
-            encoding_key: EncodingKey::from_secret(secret),
-            decoding_key: DecodingKey::from_secret(secret),
+            encoding_key: EncodingKey::from_secret(&app_key_bytes),
+            decoding_key: DecodingKey::from_secret(&app_key_bytes),
         });
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let listener = tokio::net::TcpListener::bind(app_config.app_bind).await?;
     info!("starting listener");
     axum::serve(listener, app).await?;
 
