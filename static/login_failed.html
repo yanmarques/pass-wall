@@ -1,102 +1,104 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login</title>
-    <style>
-        :root {
-            color-scheme: dark;
-        }
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Login</title>
+	<style>
+		:root {
+			color-scheme: dark;
+		}
 
-        .error-message {
-            color: #ff4d4f;
-            margin-bottom: 1rem;
-        }
+		.error-message {
+			color: #ff4d4f;
+			margin-bottom: 1rem;
+		}
 
-        body {
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            margin: 0;
-            background-color: #121212;
-            color: #e0e0e0;
-            font-family: sans-serif;
-        }
+		body {
+			display: flex;
+			flex-direction: column;
+			justify-content: center;
+			align-items: center;
+			height: 100vh;
+			margin: 0;
+			background-color: #121212;
+			color: #e0e0e0;
+			font-family: sans-serif;
+		}
 
-        .error-message {
-            color: #ff4d4f;
-            margin-bottom: 1rem;
-        }
+		.error-message {
+			color: #ff4d4f;
+			margin-bottom: 1rem;
+		}
 
-        .login-container {
-            padding: 2rem;
-            border-radius: 12px;
-            background: #1e1e1e;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-            max-width: 320px;
-            width: 100%;
-        }
+		.login-container {
+			padding: 2rem;
+			border-radius: 12px;
+			background: #1e1e1e;
+			box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+			max-width: 320px;
+			width: 100%;
+		}
 
-        h2 {
-            text-align: center;
-            margin-bottom: 1.5rem;
-        }
+		h2 {
+			text-align: center;
+			margin-bottom: 1.5rem;
+		}
 
-        label {
-            display: block;
-            margin-bottom: 0.5rem;
-        }
+		label {
+			display: block;
+			margin-bottom: 0.5rem;
+		}
 
-        input {
-            width: 100%;
-            padding: 0.75rem;
-            margin-bottom: 1rem;
-            border: none;
-            border-radius: 8px;
-            background: #2c2c2c;
-            color: #fff;
-            box-sizing: border-box;
-        }
+		input {
+			width: 100%;
+			padding: 0.75rem;
+			margin-bottom: 1rem;
+			border: none;
+			border-radius: 8px;
+			background: #2c2c2c;
+			color: #fff;
+			box-sizing: border-box;
+		}
 
-        input:focus {
-            outline: 2px solid #4a90e2;
-        }
+		input:focus {
+			outline: 2px solid #4a90e2;
+		}
 
-        button {
-            display: block;
-            width: 100%;
-            padding: 0.75rem;
-            border: none;
-            border-radius: 8px;
-            background: #4a90e2;
-            color: white;
-            cursor: pointer;
-            box-sizing: border-box;
-        }
+		button {
+			display: block;
+			width: 100%;
+			padding: 0.75rem;
+			border: none;
+			border-radius: 8px;
+			background: #4a90e2;
+			color: white;
+			cursor: pointer;
+			box-sizing: border-box;
+		}
 
-        button:hover {
-            background: #357abd;
-        }
-</style>
+		button:hover {
+			background: #357abd;
+		}
+	</style>
 </head>
+
 <body>
-    <div class="error-message">Invalid credentials</div>
+	<div class="error-message">Invalid credentials</div>
 
-    <div class="login-container">
-        <h2>Login</h2>
-        <form action="/login" method="POST">
-            <label for="username">Username</label>
-            <input type="text" id="name" name="name" required>
+	<div class="login-container">
+		<h2>Login</h2>
+		<form action="/signin" method="POST">
+			<label for="username">Username</label>
+			<input autofocus type="text" id="name" name="name" required>
 
-            <label for="password">Password</label>
-            <input type="password" id="password" name="password" required>
+			<label for="password">Password</label>
+			<input type="password" id="password" name="password" required>
 
-            <button type="submit">Login</button>
-        </form>
-    </div>
+			<button type="submit">Login</button>
+		</form>
+	</div>
 </body>
-</html>
 
+</html>

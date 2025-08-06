@@ -1,10 +1,11 @@
-app_bind: 0.0.0.0:3000
+app_bind: 127.0.0.1:9090
 app_key: secret
+session_expiration_secs: 86400
+session_cookie_name: passwall_session
 users:
   - name: admin
     password_hash: $2y$05$ri/lXPklBKhsmzhtAEran.KiHkHSZnmnoH0aodXudH.FXJ/f0O4Q.
-endpoints:
-  - domain: my.host.com:3000
-    dest: http://127.0.0.1:8080
+acl:
+  - host: public.example.com
     allowed_users:
     - admin
