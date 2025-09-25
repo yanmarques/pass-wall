@@ -3,6 +3,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::Context;
 use axum::{
     Form, Router,
     body::Body,
@@ -10,7 +11,7 @@ use axum::{
     http::Uri,
     response::{IntoResponse, Response},
 };
-use axum_extra::extract::{CookieJar, Host};
+use axum_extra::extract::{CookieJar, Host as HeaderHost};
 use bytes::Bytes;
 use clap::Parser;
 use hyper::StatusCode;
@@ -19,7 +20,7 @@ use jsonwebtoken::{
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
-use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
+use tracing_subscriber::EnvFilter;
 
 extern crate bcrypt;
 
@@ -39,18 +40,48 @@ struct User {
     password_hash: String,
 }
 
+/// Allowed host
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+struct Host {
+    value: String,
+    domain: String,
+}
+
+impl From<String> for Host {
+    fn from(value: String) -> Self {
+        let domain = parse_host_domain(&value);
+        Self { value, domain }
+    }
+}
+
 /// Define who and what can be access and be accessed
 #[derive(Clone, Debug)]
 struct Policy {
     users: rustc_hash::FxHashMap<String, User>,
-    authorized_hosts: rustc_hash::FxHashMap<User, Vec<String>>,
+    authorized_hosts: rustc_hash::FxHashMap<User, rustc_hash::FxHashMap<String, Host>>,
+}
+
+impl Policy {
+    /// Returns a [`Host`] if the given user is authorized to access the given host, according to the
+    /// defined policy.
+    ///
+    /// Returns [`None`] otherwise.
+    pub fn authorize<H>(&self, user: &User, host: H) -> Option<&Host>
+    where
+        H: AsRef<str>,
+    {
+        return self
+            .authorized_hosts
+            .get(user)
+            .and_then(|hosts| hosts.get(host.as_ref()));
+    }
 }
 
 /// All static pages
 #[derive(Clone)]
 struct StaticPages {
     login: Bytes,
-    login_failed: Bytes,
+    unauthenticated: Bytes,
     unauthorized: Bytes,
 }
 
@@ -150,7 +181,8 @@ impl TryFrom<Config> for Policy {
             );
         }
 
-        let mut authorized_hosts = rustc_hash::FxHashMap::<User, Vec<String>>::default();
+        let mut authorized_hosts =
+            rustc_hash::FxHashMap::<User, rustc_hash::FxHashMap<String, Host>>::default();
 
         for access_control in &value.acl {
             for user_name in &access_control.allowed_users {
@@ -166,10 +198,18 @@ impl TryFrom<Config> for Policy {
                 };
 
                 if let Some(hosts) = authorized_hosts.get_mut(&user) {
-                    hosts.push(access_control.host.clone());
+                    hosts.insert(
+                        access_control.host.clone(),
+                        Host::from(access_control.host.clone()),
+                    );
                 } else {
-                    authorized_hosts
-                        .insert(user.clone(), Vec::from_iter([access_control.host.clone()]));
+                    authorized_hosts.insert(
+                        user.clone(),
+                        rustc_hash::FxHashMap::from_iter([(
+                            access_control.host.clone(),
+                            Host::from(access_control.host.clone()),
+                        )]),
+                    );
                 }
             }
         }
@@ -183,23 +223,38 @@ impl TryFrom<Config> for Policy {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    tracing_subscriber::fmt::Subscriber::builder()
-        .with_line_number(true)
+    tracing_subscriber::fmt()
+        .event_format(
+            tracing_subscriber::fmt::format()
+                .with_line_number(true)
+                .compact(),
+        )
         .with_env_filter(EnvFilter::from_default_env())
-        .finish()
-        .try_init()?;
+        .init();
 
     let args = Args::parse();
-    let app_config: Config = serde_yaml_ng::from_slice(&fs::read(args.config)?)?;
+    let app_config: Config = serde_yaml_ng::from_slice(
+        &fs::read(args.config.clone()).context(format!("open config file: {}", args.config))?,
+    )
+    .context(format!("parse yaml config: {}", args.config))?;
 
     let static_pages = StaticPages {
-        login: Bytes::from_owner(fs::read("./static/login.html")?),
-        login_failed: Bytes::from_owner(fs::read("./static/login_failed.html")?),
-        unauthorized: Bytes::from_owner(fs::read("./static/unauthorized.html")?),
+        login: Bytes::from_owner(
+            fs::read("./static/login.html").context("open html ./static/login.html")?,
+        ),
+        unauthenticated: Bytes::from_owner(
+            fs::read("./static/unauthenticated.html")
+                .context("open html ./static/unauthenticated.html")?,
+        ),
+        unauthorized: Bytes::from_owner(
+            fs::read("./static/unauthorized.html")
+                .context("open html ./static/unauthorized.html")?,
+        ),
     };
 
     let policy = Policy::try_from(app_config.clone())?;
 
+    // TODO: mask password hashes
     tracing::debug!(?policy, "runtime policy");
 
     let app_key_bytes = app_config.app_key.into_bytes();
@@ -217,15 +272,47 @@ async fn main() -> Result<(), anyhow::Error> {
             session_expiration: app_config.session_expiration_secs,
         });
 
-    let listener = tokio::net::TcpListener::bind(app_config.app_bind).await?;
-    info!("starting listener");
-    axum::serve(listener, app).await?;
+    let listener = tokio::net::TcpListener::bind(app_config.app_bind.clone())
+        .await
+        .context(format!("start listener on addr: {}", app_config.app_bind))?;
+    tracing::info!("starting listener");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
     Ok(())
 }
 
+async fn shutdown_signal() {
+    use tokio::signal::unix;
+
+    let term = async {
+        unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("unable to install unix TERM signal handler")
+            .recv()
+            .await
+    };
+
+    let int = async {
+        unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("unable to install unix INT signal handler")
+            .recv()
+            .await
+    };
+
+    let mut which_signal = "SIGTERM";
+    tokio::select! {
+        _ = int => {
+            which_signal = "SIGINT";
+        }
+        _ = term => {},
+    };
+
+    info!("received signal {which_signal}, exiting");
+}
+
 /// Get the domain to use in the cookie from the Uri
-fn get_cookie_domain(host: &str) -> String {
+fn parse_host_domain(host: &str) -> String {
     let subs = host.split(".").collect::<Vec<&str>>();
     if subs.len() < 2 {
         return String::from(host);
@@ -274,123 +361,129 @@ async fn signin(
     };
 
     if let Some(user) = app_state.policy.users.get(&input.name) {
-        let valid = bcrypt::verify(input.password, &user.password_hash)?;
+        if let Ok(uri) = Uri::try_from(&redirect) {
+            if let Some(host) = app_state.policy.authorize(
+                &user,
+                uri.host()
+                    .ok_or_else(|| anyhow::anyhow!("invalid redirect host"))?,
+            ) {
+                let valid = bcrypt::verify(input.password, &user.password_hash)?;
+                if valid {
+                    let claims =
+                        Claims::new(Some(user.name.clone()), None, app_state.session_expiration);
 
-        if valid {
-            let authorized_hosts = app_state
-                .policy
-                .authorized_hosts
-                .get(&user)
-                .expect("bug? could not find allowed hosts for a valid user");
+                    let token = jsonwebtoken::encode(
+                        &Header::new(Algorithm::HS256),
+                        &claims,
+                        &app_state.encoding_key,
+                    )?;
 
-            let uri = Uri::try_from(&redirect)?;
-            let host = uri
-                .host()
-                .ok_or_else(|| anyhow::anyhow!("invalid redirect"))?;
+                    let cookie = cookie::Cookie::build((&app_state.session_cookie_name, token))
+                        .http_only(true)
+                        .domain(&host.domain)
+                        .same_site(cookie::SameSite::Strict)
+                        .build();
 
-            if !authorized_hosts.contains(&String::from(host)) {
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/html; charset=utf-8")
-                    .body(Body::from(app_state.static_pages.unauthorized))?);
+                    return Ok(Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header("location", redirect)
+                        .header("set-cookie", cookie.to_string())
+                        .body(Body::empty())?);
+                }
             }
-
-            let claims = Claims::new(Some(user.name.clone()), None, app_state.session_expiration);
-
-            let token = jsonwebtoken::encode(
-                &Header::new(Algorithm::HS256),
-                &claims,
-                &app_state.encoding_key,
-            )?;
-
-            let cookie = cookie::Cookie::build((&app_state.session_cookie_name, token))
-                .http_only(true)
-                .domain(get_cookie_domain(host))
-                .same_site(cookie::SameSite::Strict)
-                .build();
-
-            return Ok(Response::builder()
-                .status(StatusCode::FOUND)
-                .header("location", &redirect)
-                .header("set-cookie", cookie.to_string())
-                .body(Body::empty())?);
         }
     }
 
     return Ok(Response::builder()
         .status(StatusCode::OK)
+        .header("location", "/")
         .header("content-type", "text/html; charset=utf-8")
-        .body(Body::from(app_state.static_pages.login_failed))?);
+        .body(Body::from(app_state.static_pages.unauthenticated))?);
 }
 
 async fn show_signin(
     State(app_state): State<AppState>,
     Query(signin_query): Query<SigninQuery>,
-) -> Result<Response, AppError> {
-    if let Some(redirect) = &signin_query.redirect {
-        if Uri::try_from(redirect).is_ok() {
-            let claims = Claims::new(None, Some(redirect.clone()), 60 * 60);
-            let token = jsonwebtoken::encode(
-                &Header::new(Algorithm::HS256),
-                &claims,
-                &app_state.encoding_key,
-            )?;
-
-            let cookie = cookie::Cookie::build((&app_state.session_cookie_name, token))
-                .http_only(true)
-                .same_site(cookie::SameSite::Strict);
-
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "text/html; charset=utf-8")
-                .header("set-cookie", cookie.to_string())
-                .body(Body::from(app_state.static_pages.login))
-                .expect("could not build response from static login page"));
-        }
-    }
-
-    return Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/html; charset=utf-8")
-        .body(Body::from(app_state.static_pages.login))
-        .expect("could not build response from static login page"));
-}
-
-async fn proxy_authenticate(
-    State(app_state): State<AppState>,
-    Host(header_host): Host,
     jar: CookieJar,
 ) -> Result<Response, AppError> {
+    let redirect = signin_query
+        .redirect
+        .and_then(|url| Uri::try_from(url).ok())
+        .ok_or_else(|| AppError::from(anyhow::anyhow!("missing redirect query param")))?;
+
     let authenticated_user = jar
         .get(&app_state.session_cookie_name)
         .and_then(|cookie| validate_token(cookie.value(), &app_state.decoding_key))
         .and_then(|token| token.claims.user)
         .and_then(|user| app_state.policy.users.get(&user));
 
-    if authenticated_user.is_none() {
+    if let Some(user) = authenticated_user {
+        if let Some(_host) = app_state.policy.authorize(
+            &user,
+            redirect
+                .host()
+                .ok_or_else(|| anyhow::anyhow!("invalid redirect host"))?,
+        ) {
+            return Ok(Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", redirect.to_string())
+                .body(Body::empty())?);
+        }
+
+        return Ok(Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("content-type", "text/html; charset=utf-8")
+            .body(Body::from(app_state.static_pages.unauthorized))?);
+    }
+
+    let claims = Claims::new(
+        None,
+        Some(redirect.to_string()),
+        app_state.session_expiration,
+    );
+    let token = jsonwebtoken::encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &app_state.encoding_key,
+    )?;
+
+    let cookie = cookie::Cookie::build((&app_state.session_cookie_name, token))
+        .http_only(true)
+        .same_site(cookie::SameSite::Strict);
+
+    return Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .header("set-cookie", cookie.to_string())
+        .body(Body::from(app_state.static_pages.login.clone()))?);
+}
+
+async fn proxy_authenticate(
+    State(app_state): State<AppState>,
+    HeaderHost(header_host): HeaderHost,
+    jar: CookieJar,
+) -> Result<Response, AppError> {
+    let authorized_hosts = jar
+        .get(&app_state.session_cookie_name)
+        .and_then(|cookie| validate_token(cookie.value(), &app_state.decoding_key))
+        .and_then(|token| token.claims.user)
+        .and_then(|user| app_state.policy.users.get(&user))
+        .and_then(|authenticated_user| {
+            tracing::debug!(user = authenticated_user.name, header_host, "authenticated");
+            app_state
+                .policy
+                .authorize(&authenticated_user, &header_host)
+        });
+
+    if authorized_hosts.is_none() {
         return Ok(Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .body(Body::empty())?);
     }
 
-    let user = authenticated_user.expect("unwrap authenticated user");
-    debug!(user = user.name, "authenticated user");
-
-    let authorized_hosts = app_state
-        .policy
-        .authorized_hosts
-        .get(&user)
-        .expect("bug? could not find allowed hosts for a valid user");
-
-    if authorized_hosts.contains(&header_host) {
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .body(Body::empty())?);
-    }
-
-    Ok(Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .body(Body::empty())?)
+    return Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())?);
 }
 
 #[cfg(test)]
@@ -398,20 +491,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_cookie_domain_with_subdomain() {
-        let result = get_cookie_domain("public.example.com");
+    fn test_parse_host_domain_with_subdomain() {
+        let result = parse_host_domain("public.example.com");
         assert_eq!(result, ".example.com");
     }
 
     #[test]
-    fn test_get_cookie_domain_with_regular_domain() {
-        let result = get_cookie_domain("example.com");
+    fn test_parse_host_domain_with_regular_domain() {
+        let result = parse_host_domain("example.com");
         assert_eq!(result, ".example.com");
     }
 
     #[test]
-    fn test_get_cookie_domain_with_localhost() {
-        let result = get_cookie_domain("localhost");
+    fn test_parse_host_domain_with_localhost() {
+        let result = parse_host_domain("localhost");
         assert_eq!(result, "localhost");
     }
 }

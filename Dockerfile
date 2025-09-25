@@ -17,6 +17,5 @@ WORKDIR /app/
 COPY --from=builder /app/target/debug/pass-wall /app/
 COPY ./static/ /app/static/
 
-CMD /app/pass-wall
-
+ENTRYPOINT ["/app/pass-wall"]
 
