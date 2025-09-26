@@ -1,165 +1,92 @@
+use std::time::Duration;
+
 use criterion::{Criterion, criterion_group, criterion_main};
-use heapless::LinearMap;
-use rand::Rng;
-use rustc_hash::FxHashMap;
-use std::{collections::BTreeMap, hint::black_box};
+use pass_wall::{AccessControlConfig, Host, Policy, User};
+use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
 
-const MAP_SIZE: usize = 16;
-
-struct KeyValue {
-    key: String,
-    #[allow(dead_code)]
-    value: i32,
-}
-
-#[inline]
-fn search_btreemap(map: &BTreeMap<String, i32>, key: &String) {
-    let value = map.get(key);
-    black_box(value);
-}
-
-#[inline]
-fn search_fxhashmap(map: &FxHashMap<String, i32>, key: &String) {
-    let value = map.get(key);
-    black_box(value);
-}
-
-#[inline]
-fn search_linearmap(map: &LinearMap<String, i32, MAP_SIZE>, key: &String) {
-    let value = map.get(key);
-    black_box(value);
-}
-
-#[inline]
-fn search_hb_hashmap(map: &hashbrown::HashMap<String, i32>, key: &String) {
-    let value = map.get(key);
-    black_box(value);
-}
-
-#[inline]
-fn search_vector(map: &Vec<KeyValue>, key: &String) {
-    for kv in map.iter() {
-        if kv.key == *key {
-            black_box(kv);
-            break;
-        }
+fn policy_test(user: &User, acls: &[AccessControlConfig]) -> Policy {
+    let mut hosts = rustc_hash::FxHashMap::default();
+    for acl in acls.iter() {
+        hosts.insert(acl.host.clone(), Host::from(acl.host.clone(), &acl));
     }
+
+    let policy = Policy {
+        users: rustc_hash::FxHashMap::from_iter([(user.name.clone(), user.clone())]),
+        authorized_hosts: rustc_hash::FxHashMap::from_iter([(user.name.clone(), hosts)]),
+    };
+    return policy;
+}
+
+fn generate_policy_test(user: &User, length: usize) -> anyhow::Result<Policy> {
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut acls = Vec::with_capacity(length);
+    for _ in 0..length {
+        let ndots = 2 + rng.next_u32() % 2;
+        let mut subs = Vec::with_capacity(ndots as usize);
+        for _ in 0..ndots as usize {
+            let mut bytes = Vec::<u8>::with_capacity(6);
+            let sublen = 2 + rng.next_u32() % 6;
+            for _ in 0..sublen {
+                bytes.push(0);
+            }
+            rng.fill_bytes(&mut bytes);
+            let sub = hex::encode(bytes);
+            subs.push(sub);
+        }
+
+        acls.push(AccessControlConfig {
+            host: subs.join("."),
+            host_is_subdomain: rng.random(),
+            include_subdomains: rng.random(),
+            include_siblings: rng.random(),
+            allowed_users: vec![],
+        });
+    }
+
+    Ok(policy_test(user, &acls))
+}
+
+fn bench_policy_authorize(user: &User, policy: &Policy) {
+    policy.authorize(&user.name, "sub.example.com");
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let mut btreemap: BTreeMap<String, i32> = BTreeMap::new();
-    let mut fxhashmap: FxHashMap<String, i32> = FxHashMap::default();
-    let mut linearmap: LinearMap<String, i32, MAP_SIZE> = LinearMap::default();
-    let mut hb_hashmap: hashbrown::HashMap<String, i32> = hashbrown::HashMap::new();
-    let mut vector: Vec<KeyValue> = Vec::new();
+    let user = User {
+        name: String::from("admin"),
+        password_hash: String::new(),
+    };
 
-    let mut rng = rand::rng();
-    let mut keys: Vec<String> = vec![];
-
-    for _ in 0..MAP_SIZE {
-        let key = (0..32)
-            .map(|_| rng.sample(rand::distr::Alphanumeric) as char)
-            .map(String::from)
-            .collect::<Vec<String>>()
-            .join("");
-        keys.push(key.clone());
-        btreemap.insert(key.clone(), 1);
-        hb_hashmap.insert(key.clone(), 1);
-        vector.push(KeyValue {
-            key: key.clone(),
-            value: 1,
-        });
-        linearmap
-            .insert(key.clone(), 1)
-            .expect("insert value in LinearMap");
-        fxhashmap.insert(key, 1);
-    }
-
-    c.bench_function("btree_hashmap_known_key", |b| {
-        b.iter(|| {
-            for key in keys.iter() {
-                search_btreemap(black_box(&btreemap), key);
-            }
-        })
+    let mut group = c.benchmark_group("Policy::authorize");
+    group.bench_function("length-100", |b| {
+        b.iter_batched(
+            || generate_policy_test(&user, 100).expect("generate policy test"),
+            |policy| bench_policy_authorize(&user.clone(), &policy),
+            criterion::BatchSize::LargeInput,
+        );
     });
+    group.finish();
 
-    let unknown_key = (0..32)
-        .map(|_| rng.sample(rand::distr::Alphanumeric) as char)
-        .map(String::from)
-        .collect::<Vec<String>>()
-        .join("");
-
-    c.bench_function("btree_hashmap_unknown_key", |b| {
-        b.iter(|| {
-            for _ in 0..keys.len() {
-                search_btreemap(black_box(&btreemap), &unknown_key);
-            }
-        })
+    let mut group = c.benchmark_group("Policy::authorize");
+    group.bench_function("length-10000", |b| {
+        b.iter_batched(
+            || generate_policy_test(&user, 10000).expect("generate policy test"),
+            |policy| bench_policy_authorize(&user.clone(), &policy),
+            criterion::BatchSize::LargeInput,
+        );
     });
+    group.finish();
 
-    c.bench_function("fx_hashmap_known_key", |b| {
-        b.iter(|| {
-            for key in keys.iter() {
-                search_fxhashmap(black_box(&fxhashmap), &key);
-            }
-        })
+    let mut group = c.benchmark_group("Policy::authorize");
+    group.sample_size(50);
+    group.warm_up_time(Duration::from_secs(60));
+    group.bench_function("length-1000000", |b| {
+        b.iter_batched(
+            || generate_policy_test(&user, 1000000).expect("generate policy test"),
+            |policy| bench_policy_authorize(&user.clone(), &policy),
+            criterion::BatchSize::LargeInput,
+        );
     });
-
-    c.bench_function("fx_hashmap_unknown_key", |b| {
-        b.iter(|| {
-            for _ in 0..keys.len() {
-                search_fxhashmap(black_box(&fxhashmap), &unknown_key);
-            }
-        })
-    });
-
-    c.bench_function("linearmap_known_key", |b| {
-        b.iter(|| {
-            for key in keys.iter() {
-                search_linearmap(black_box(&linearmap), &key);
-            }
-        })
-    });
-
-    c.bench_function("linearmap_unknown_key", |b| {
-        b.iter(|| {
-            for _ in 0..keys.len() {
-                search_linearmap(black_box(&linearmap), &unknown_key);
-            }
-        })
-    });
-
-    c.bench_function("hb_hashmap_known_key", |b| {
-        b.iter(|| {
-            for key in keys.iter() {
-                search_hb_hashmap(black_box(&hb_hashmap), &key);
-            }
-        })
-    });
-
-    c.bench_function("hb_hashmap_unknown_key", |b| {
-        b.iter(|| {
-            for _ in 0..keys.len() {
-                search_hb_hashmap(black_box(&hb_hashmap), &unknown_key);
-            }
-        })
-    });
-
-    c.bench_function("vector_known_key", |b| {
-        b.iter(|| {
-            for key in keys.iter() {
-                search_vector(black_box(&vector), &key);
-            }
-        })
-    });
-
-    c.bench_function("vector_unknown_key", |b| {
-        b.iter(|| {
-            for _ in 0..keys.len() {
-                search_vector(black_box(&vector), &unknown_key);
-            }
-        })
-    });
+    group.finish();
 }
 
 criterion_group!(benches, criterion_benchmark);
