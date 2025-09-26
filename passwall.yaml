@@ -1,11 +1,16 @@
-app_bind: 0.0.0.0:9090
-app_key: secret
-session_expiration_secs: 86400
-session_cookie_name: passwall_session
+app_bind: 0.0.0.0:9000
+app_key: 12315e0e9aebb939145afec3d315d595644c443d6ab76f7b238c763813905faf
+session:
+  cookie_name: passwall_session
+  expiration_secs: 3600
+  same_site: strict
+  insecure_http: true
+  disable_secure_http_only: false
 users:
   - name: admin
     password_hash: $2y$05$.XV4gWa4phhQ1oAZQ0dZS.f/ogmQjMTOcD0iVzPWRMvnTIZmn94P2
 acl:
   - host: public.example.com
+    include_subdomains: false
     allowed_users:
     - admin
