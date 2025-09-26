@@ -20,6 +20,7 @@ const DEFAULT_PASSWORD: &str = "admin";
 const DEFAULT_HOST: &str = "private.example.com";
 
 struct TestContainer {
+    #[allow(dead_code)]
     container: ContainerAsync<GenericImage>,
     client: Client,
     base_url: Url,
@@ -168,22 +169,18 @@ async fn check_proxy_auth(
     client: &TestContainer,
     host: &str,
     session: &String,
-) -> anyhow::Result<()> {
-    assert_eq!(
-        client
-            .get("/authenticate")
-            .header("host", host)
-            .header(
-                "cookie",
-                format!("{}={}", config.session_cookie_name, session)
-            )
-            .send()
-            .await?
-            .status(),
-        StatusCode::OK
-    );
-
-    Ok(())
+) -> anyhow::Result<bool> {
+    return Ok(client
+        .get("/authenticate")
+        .header("host", host)
+        .header(
+            "cookie",
+            format!("{}={}", config.session_cookie_name, session),
+        )
+        .send()
+        .await?
+        .status()
+        == StatusCode::OK);
 }
 
 #[tokio::test]
@@ -201,7 +198,102 @@ async fn test_authorizes_user() -> anyhow::Result<()> {
     .await?
     .expect("failed to sign in");
 
-    check_proxy_auth(&config, &client, DEFAULT_HOST, &session).await?;
+    assert!(check_proxy_auth(&config, &client, DEFAULT_HOST, &session).await?);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rejects_invalid_password() -> anyhow::Result<()> {
+    let config = default_config();
+
+    let client = build_client(&config).await?;
+    assert_eq!(
+        signin(
+            &config,
+            &client,
+            DEFAULT_HOST,
+            DEFAULT_USER,
+            "notthepassword",
+        )
+        .await?,
+        None
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rejects_invalid_credentials() -> anyhow::Result<()> {
+    let config = default_config();
+
+    let client = build_client(&config).await?;
+    assert_eq!(
+        signin(&config, &client, DEFAULT_HOST, "user123", "notthepassword",).await?,
+        None
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rejects_valid_credentials_unauthorized_host() -> anyhow::Result<()> {
+    let config = default_config();
+
+    let client = build_client(&config).await?;
+    assert_eq!(
+        signin(
+            &config,
+            &client,
+            "notexists.example.com",
+            DEFAULT_USER,
+            DEFAULT_PASSWORD
+        )
+        .await?,
+        None
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rejects_host_impersonation() -> anyhow::Result<()> {
+    let config = default_config();
+
+    let client = build_client(&config).await?;
+    let session = signin(
+        &config,
+        &client,
+        DEFAULT_HOST,
+        DEFAULT_USER,
+        DEFAULT_PASSWORD,
+    )
+    .await?
+    .expect("failed to sign in");
+
+    assert!(check_proxy_auth(&config, &client, DEFAULT_HOST, &session).await?);
+    assert!(!check_proxy_auth(&config, &client, "notthehost.example.com", &session).await?);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rejects_host_impersonation() -> anyhow::Result<()> {
+    let config = default_config();
+
+    let client = build_client(&config).await?;
+    let session = signin(
+        &config,
+        &client,
+        DEFAULT_HOST,
+        DEFAULT_USER,
+        DEFAULT_PASSWORD,
+    )
+    .await?
+    .expect("failed to sign in");
+
+    assert!(check_proxy_auth(&config, &client, DEFAULT_HOST, &session).await?);
+    assert!(!check_proxy_auth(&config, &client, "notthehost.example.com", &session).await?);
 
     Ok(())
 }
