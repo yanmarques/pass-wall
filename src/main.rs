@@ -8,6 +8,7 @@ use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use clap::{Parser, Subcommand};
 use pass_wall::Config;
 use rand::{TryRngCore, rngs::OsRng};
+use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -59,7 +60,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 .with_line_number(true)
                 .compact(),
         )
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into()))
         .init();
 
     let cli = Cli::parse();

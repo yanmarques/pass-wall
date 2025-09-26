@@ -8,7 +8,7 @@ session:
   disable_secure_http_only: false
 users:
   - name: admin
-    password_hash: $2y$05$.XV4gWa4phhQ1oAZQ0dZS.f/ogmQjMTOcD0iVzPWRMvnTIZmn94P2
+    password_hash: $argon2id$v=19$m=19456,t=2,p=1$IEgmAxZvkzsHx6FMnpQwdw$boMkRfsSnSYW7wPrp3R50n9FLciVTQZUOvX81G0HVd8
 acl:
   - host: public.example.com
     host_is_subdomain: true

@@ -340,10 +340,11 @@ impl TryFrom<Config> for Policy {
             }
 
             if let Err(err) = PasswordHash::new(&user.password_hash) {
+                let char = user.password_hash.chars().last();
                 return Err(anyhow::anyhow!(
-                    "User password hash is invalid or malformed. Affected user: {}, password_hash: {}, err: {:?}",
+                    "User password hash is invalid or malformed. Affected user: {}, password hash: ...{}, err: {:?}",
                     user.name,
-                    user.password_hash,
+                    char.unwrap_or(' '),
                     err,
                 ));
             }
