@@ -1842,6 +1842,7 @@ dependencies = [
  "tempfile",
  "testcontainers",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
