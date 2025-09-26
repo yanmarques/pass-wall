@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use axum::{body::Body, http::Request};
 use cookie::Cookie;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
@@ -96,10 +97,18 @@ async fn bench_app_signin(config: &Config, user: &str, password: &str) {
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
+    let mut salt = vec![0; 8];
+    let salt_string = SaltString::encode_b64(&mut salt).expect("generate password hash salt");
     let user = User {
         name: String::from("admin"),
-        password_hash: bcrypt::hash(DEFAULT_PASSWORD, bcrypt::DEFAULT_COST)
-            .expect("bcrypt::hash default password"),
+        password_hash: Argon2::default()
+            .hash_password(DEFAULT_PASSWORD.as_bytes(), &salt_string)
+            .expect(&format!(
+                "failed to hash password, for some reason: {}",
+                DEFAULT_PASSWORD
+            ))
+            .serialize()
+            .to_string(),
     };
     let rt = Runtime::new().expect("span new runtime");
 

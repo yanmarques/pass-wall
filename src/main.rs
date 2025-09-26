@@ -4,8 +4,10 @@ use std::{
 };
 
 use anyhow::Context;
+use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use clap::{Parser, Subcommand};
 use pass_wall::Config;
+use rand::{TryRngCore, rngs::OsRng};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -17,7 +19,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    #[command(about = "Start proxy authentication HTTP server")]
+    #[command(about = "Start proxy authentication HTTP server.")]
     Serve {
         #[arg(short, long, default_value = "passwall.yaml")]
         config: PathBuf,
@@ -25,7 +27,7 @@ enum Commands {
 
     #[command(
         about = "Generate a default configuration.",
-        long_about = "The default configuration will use secure defaults and generate a new key for you. However, you are still responsible for adding users and authorized hosts in the configuration file"
+        long_about = "The default configuration will use secure defaults and generate a new key for you. However, you are still responsible for adding users and authorized hosts in the configuration file."
     )]
     Generate {
         #[arg(
@@ -34,6 +36,18 @@ enum Commands {
             help = "Save configuration in the given path. Panics if given path already exists."
         )]
         out: PathBuf,
+    },
+    #[command(
+        about = "Compute password hash.",
+        long_about = "Use computed hash in the configuration file."
+    )]
+    Hash {
+        #[arg(
+            short,
+            long,
+            help = "Optional password. Read from the terminal if not provided."
+        )]
+        pass: Option<String>,
     },
 }
 
@@ -57,6 +71,27 @@ async fn main() -> Result<(), anyhow::Error> {
             let config = Config::default();
             let contents = serde_yaml_ng::to_string(&config)?;
             std::fs::write(out, contents)?;
+        }
+        Commands::Hash { pass } => {
+            let password = match pass {
+                Some(p) => p,
+                None => rpassword::prompt_password("Password: ")?,
+            };
+
+            let mut salt = vec![0; argon2::RECOMMENDED_SALT_LEN];
+            OsRng.try_fill_bytes(&mut salt)?;
+            let salt_string = SaltString::encode_b64(&salt).map_err(|err| {
+                tracing::error!(?err);
+                return anyhow::anyhow!("failed to generate salt string");
+            })?;
+
+            let hash = Argon2::default()
+                .hash_password(password.as_bytes(), &salt_string)
+                .map_err(|err| {
+                    tracing::error!(?err);
+                    return anyhow::anyhow!("failed to hash password");
+                })?;
+            println!("{}", hash);
         }
     }
 

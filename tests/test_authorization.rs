@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, path::Path, str::FromStr, sync::Arc};
 
+use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use hyper::StatusCode;
 use pass_wall::{AccessControlConfig, Config, Policy, User};
 use reqwest::{
@@ -168,12 +169,19 @@ impl TestClient {
 }
 
 fn new_user(name: &str, password: &str) -> User {
+    // iv not initialized, doesn't matter
+    let mut salt = vec![0; 8];
+    let salt_string = SaltString::encode_b64(&mut salt).expect("generate password hash salt");
     User {
         name: String::from(name),
-        password_hash: bcrypt::hash(password, bcrypt::DEFAULT_COST).expect(&format!(
-            "failed to hash password, for some reason: {}",
-            password
-        )),
+        password_hash: Argon2::default()
+            .hash_password(password.as_bytes(), &salt_string)
+            .expect(&format!(
+                "failed to hash password, for some reason: {}",
+                password
+            ))
+            .serialize()
+            .to_string(),
     }
 }
 

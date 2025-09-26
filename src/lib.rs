@@ -3,6 +3,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Form, Router,
     body::Body,
@@ -19,11 +20,12 @@ use jsonwebtoken::{
 use rand::{TryRngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 
-extern crate bcrypt;
-
 pub const DEFAULT_KEYSIZE: usize = 32;
 pub const DEFAULT_COOKIE_NAME: &str = "passwall_session";
 pub const DEFAULT_PORT: u16 = 9000;
+pub const MAX_PASSWORD_LENGTH: usize = 256;
+pub const MAX_USER_LENGTH: usize = 256;
+pub const MAX_BODY_LENGTH: usize = (MAX_PASSWORD_LENGTH + MAX_USER_LENGTH) * 2;
 
 /// JWT claims
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,11 +39,11 @@ pub struct Claims {
 #[derive(Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct User {
     pub name: String,
-    // bcrypt
+    // Argon password bytes
     pub password_hash: String,
 }
 
-impl Debug for User {
+impl<'a> Debug for User {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("User")
             .field("name", &self.name)
@@ -330,6 +332,22 @@ impl TryFrom<Config> for Policy {
     fn try_from(value: Config) -> Result<Self, Self::Error> {
         let mut users = rustc_hash::FxHashMap::<String, User>::default();
         for user in &value.users {
+            if user.name.len() > MAX_USER_LENGTH {
+                return Err(anyhow::anyhow!(
+                    "User name is too large. To keep things civilized, the maximum user name length is hardcapped to {}",
+                    MAX_USER_LENGTH,
+                ));
+            }
+
+            if let Err(err) = PasswordHash::new(&user.password_hash) {
+                return Err(anyhow::anyhow!(
+                    "User password hash is invalid or malformed. Affected user: {}, password_hash: {}, err: {:?}",
+                    user.name,
+                    user.password_hash,
+                    err,
+                ));
+            }
+
             users.insert(
                 user.name.clone(),
                 User {
@@ -343,6 +361,13 @@ impl TryFrom<Config> for Policy {
             rustc_hash::FxHashMap::<String, rustc_hash::FxHashMap<String, Host>>::default();
 
         for access_control in &value.acl {
+            if !access_control.host_is_subdomain && access_control.include_siblings {
+                return Err(anyhow::anyhow!(
+                    "Only subdomains can include siblings. For instance, one does not usually want to serve 'example.com' base domain and all other domains hosted on '.com' top level domain. Affected host '{}'",
+                    access_control.host,
+                ));
+            }
+
             for user_name in &access_control.allowed_users {
                 let user = match users.get(user_name) {
                     Some(u) => u,
@@ -459,6 +484,13 @@ async fn signin(
     jar: CookieJar,
     Form(input): Form<LoginInput>,
 ) -> Result<Response, AppError> {
+    if input.name.len() > MAX_USER_LENGTH || input.password.len() > MAX_PASSWORD_LENGTH {
+        return Ok(Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("content-type", "text/html; charset=utf-8")
+            .body(Body::from(app_state.static_pages.unauthenticated))?);
+    }
+
     let redirect = match jar
         .get(&app_state.session.cookie_name)
         .and_then(|prev_cookie| validate_token(prev_cookie.value(), &app_state.decoding_key))
@@ -479,8 +511,15 @@ async fn signin(
                 .host()
                 .ok_or_else(|| anyhow::anyhow!("invalid redirect host"))?;
             if let Some(host) = app_state.policy.authorize(&user.name, header_host) {
-                let valid = bcrypt::verify(input.password, &user.password_hash)?;
-                if valid {
+                let parsed_hash = PasswordHash::new(&user.password_hash).map_err(|err| {
+                    tracing::error!(?err, "failed to parse user's password hash");
+                    return anyhow::anyhow!("failed to parse user's password");
+                })?;
+
+                let crypto_op =
+                    Argon2::default().verify_password(input.password.as_bytes(), &parsed_hash);
+
+                if crypto_op.is_ok() {
                     let claims = Claims::new(
                         Some(user.name.clone()),
                         None,

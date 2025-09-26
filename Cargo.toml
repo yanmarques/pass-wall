@@ -8,9 +8,9 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1.0.97"
+argon2 = "0.5.3"
 axum = { version = "0.8.4", default-features = false, features = ["form", "http1", "http2", "matched-path", "multipart", "original-uri", "tokio", "tower-log", "tracing", "ws", "query"] }
 axum-extra = { version = "0.10.1", default-features = false, features = ["cookie", "typed-header"] }
-bcrypt = "0.17.0"
 bytes = { version = "1.10.1", default-features = false }
 clap = { version = "=4.5.41", features = ["derive"] }
 cookie = { version = "0.18.1", default-features = false, features = ["percent-encode"] }
@@ -18,6 +18,7 @@ hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 hyper = { version = "1.6.0", default-features = false }
 jsonwebtoken = { version = "9.3.1", default-features = false }
 rand = { version = "0.9.0", default-features = false, features = ["os_rng"] }
+rpassword = "7.4.0"
 rustc-hash = "2.1.1"
 serde = { version = "1.0.219", default-features = false }
 serde_yaml_ng = "0.10.0"
@@ -26,7 +27,6 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
 [dev-dependencies]
-bcrypt = "0.17.0"
 criterion = "0.5.1"
 hashbrown = "0.15.2"
 heapless = "0.8.0"
