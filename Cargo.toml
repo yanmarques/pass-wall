@@ -3,6 +3,9 @@ name = "pass-wall"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1.0.97"
 axum = { version = "0.8.4", default-features = false, features = ["form", "http1", "http2", "matched-path", "multipart", "original-uri", "tokio", "tower-log", "tracing", "ws", "query"] }
@@ -21,10 +24,15 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
 [dev-dependencies]
+bcrypt = "0.17.0"
 criterion = "0.5.1"
 hashbrown = "0.15.2"
 heapless = "0.8.0"
 rand = "0.9.0"
+reqwest = { version = "0.12.23", features = ["cookies"] }
+tempfile = "3.23.0"
+testcontainers = "0.25.0"
+tokio = { version = "1.44.1", default-features = false, features = ["test-util", "process"] }
 
 [[bench]]
 name = "map_benchmark"

@@ -1,7 +1,4 @@
-use std::{
-    fs,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::fs;
 
 use anyhow::Context;
 use axum::{
@@ -18,83 +15,10 @@ use hyper::StatusCode;
 use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation, errors::ErrorKind,
 };
-use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info};
+use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
-extern crate bcrypt;
-
-/// JWT claims
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    redirect: Option<String>,
-    user: Option<String>,
-    exp: u64,
-}
-
-/// Allowed user
-#[derive(Debug, Clone, Hash, Eq, PartialEq, Deserialize)]
-struct User {
-    name: String,
-    // bcrypt
-    password_hash: String,
-}
-
-/// Allowed host
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-struct Host {
-    value: String,
-    domain: String,
-}
-
-impl From<String> for Host {
-    fn from(value: String) -> Self {
-        let domain = parse_host_domain(&value);
-        Self { value, domain }
-    }
-}
-
-/// Define who and what can be access and be accessed
-#[derive(Clone, Debug)]
-struct Policy {
-    users: rustc_hash::FxHashMap<String, User>,
-    authorized_hosts: rustc_hash::FxHashMap<User, rustc_hash::FxHashMap<String, Host>>,
-}
-
-impl Policy {
-    /// Returns a [`Host`] if the given user is authorized to access the given host, according to the
-    /// defined policy.
-    ///
-    /// Returns [`None`] otherwise.
-    pub fn authorize<H>(&self, user: &User, host: H) -> Option<&Host>
-    where
-        H: AsRef<str>,
-    {
-        return self
-            .authorized_hosts
-            .get(user)
-            .and_then(|hosts| hosts.get(host.as_ref()));
-    }
-}
-
-/// All static pages
-#[derive(Clone)]
-struct StaticPages {
-    login: Bytes,
-    unauthenticated: Bytes,
-    unauthorized: Bytes,
-}
-
-/// Some shared data
-#[derive(Clone)]
-struct AppState {
-    encoding_key: EncodingKey,
-    decoding_key: DecodingKey,
-    static_pages: StaticPages,
-    policy: Policy,
-    session_cookie_name: String,
-    session_expiration: u64,
-}
+use pass_wall::{Claims, Config, Policy};
 
 /// Login form input
 #[derive(Deserialize, Debug)]
@@ -103,32 +27,28 @@ struct LoginInput {
     password: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct AccessControlConfig {
-    host: String,
-    allowed_users: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct Config {
-    app_bind: String,
-    app_key: String,
-    users: Vec<User>,
-    acl: Vec<AccessControlConfig>,
-    session_cookie_name: String,
-    session_expiration_secs: u64,
-}
-
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    #[arg(short, long, default_value = "passwall.yaml")]
-    config: String,
-}
-
 #[derive(Deserialize, Debug)]
 struct SigninQuery {
     redirect: Option<String>,
+}
+
+/// All static pages
+#[derive(Clone)]
+pub struct StaticPages {
+    pub login: Bytes,
+    pub unauthenticated: Bytes,
+    pub unauthorized: Bytes,
+}
+
+/// Some shared data
+#[derive(Clone)]
+pub struct AppState {
+    pub encoding_key: EncodingKey,
+    pub decoding_key: DecodingKey,
+    pub static_pages: StaticPages,
+    pub policy: Policy,
+    pub session_cookie_name: String,
+    pub session_expiration: u64,
 }
 
 /// Local app error
@@ -136,7 +56,7 @@ struct AppError(anyhow::Error);
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        error!(error = ?self.0, "request handling error");
+        tracing::error!(error = ?self.0, "request handling error");
 
         (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong").into_response()
     }
@@ -151,74 +71,11 @@ where
     }
 }
 
-impl Claims {
-    fn new(user: Option<String>, redirect: Option<String>, expire_in: u64) -> Self {
-        let expiration = SystemTime::now() + Duration::from_secs(expire_in);
-
-        Claims {
-            redirect,
-            user,
-            exp: expiration
-                .duration_since(UNIX_EPOCH)
-                .expect("can not get current timestamp")
-                .as_secs(),
-        }
-    }
-}
-
-impl TryFrom<Config> for Policy {
-    type Error = anyhow::Error;
-
-    fn try_from(value: Config) -> Result<Self, Self::Error> {
-        let mut users = rustc_hash::FxHashMap::<String, User>::default();
-        for user in &value.users {
-            users.insert(
-                user.name.clone(),
-                User {
-                    name: user.name.clone(),
-                    password_hash: user.password_hash.clone(),
-                },
-            );
-        }
-
-        let mut authorized_hosts =
-            rustc_hash::FxHashMap::<User, rustc_hash::FxHashMap<String, Host>>::default();
-
-        for access_control in &value.acl {
-            for user_name in &access_control.allowed_users {
-                let user = match users.get(user_name) {
-                    Some(u) => u,
-                    None => {
-                        return Err(anyhow::anyhow!(
-                            "The endpoint '{}' configuration specifies an inexistent user called '{}'",
-                            access_control.host,
-                            user_name
-                        ));
-                    }
-                };
-
-                if let Some(hosts) = authorized_hosts.get_mut(&user) {
-                    hosts.insert(
-                        access_control.host.clone(),
-                        Host::from(access_control.host.clone()),
-                    );
-                } else {
-                    authorized_hosts.insert(
-                        user.clone(),
-                        rustc_hash::FxHashMap::from_iter([(
-                            access_control.host.clone(),
-                            Host::from(access_control.host.clone()),
-                        )]),
-                    );
-                }
-            }
-        }
-
-        Ok(Policy {
-            users,
-            authorized_hosts,
-        })
-    }
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, default_value = "passwall.yaml")]
+    config: String,
 }
 
 #[tokio::main]
@@ -239,17 +96,9 @@ async fn main() -> Result<(), anyhow::Error> {
     .context(format!("parse yaml config: {}", args.config))?;
 
     let static_pages = StaticPages {
-        login: Bytes::from_owner(
-            fs::read("./static/login.html").context("open html ./static/login.html")?,
-        ),
-        unauthenticated: Bytes::from_owner(
-            fs::read("./static/unauthenticated.html")
-                .context("open html ./static/unauthenticated.html")?,
-        ),
-        unauthorized: Bytes::from_owner(
-            fs::read("./static/unauthorized.html")
-                .context("open html ./static/unauthorized.html")?,
-        ),
+        login: Bytes::from_owner(include_bytes!("./../static/login.html")),
+        unauthenticated: Bytes::from_owner(include_bytes!("./../static/unauthenticated.html")),
+        unauthorized: Bytes::from_owner(include_bytes!("./../static/unauthorized.html")),
     };
 
     let policy = Policy::try_from(app_config.clone())?;
@@ -308,19 +157,7 @@ async fn shutdown_signal() {
         _ = term => {},
     };
 
-    info!("received signal {which_signal}, exiting");
-}
-
-/// Get the domain to use in the cookie from the Uri
-fn parse_host_domain(host: &str) -> String {
-    let subs = host.split(".").collect::<Vec<&str>>();
-    if subs.len() < 2 {
-        return String::from(host);
-    }
-
-    let mut domain = String::from(&subs[subs.len() - 2..].join("."));
-    domain.insert(0, '.');
-    return domain;
+    tracing::info!("received signal {which_signal}, exiting");
 }
 
 /// Return whether the given token is a valid JWT token for the key
@@ -329,10 +166,10 @@ fn validate_token(token: &str, key: &DecodingKey) -> Option<TokenData<Claims>> {
     match jsonwebtoken::decode::<Claims>(token, key, &validation) {
         Ok(data) => Some(data),
         Err(err) => {
-            error!(?err, "token is invalid");
+            tracing::error!(?err, "token is invalid");
             match *err.kind() {
-                ErrorKind::InvalidToken => error!("Token is invalid"),
-                ErrorKind::InvalidIssuer => error!("Issuer is invalid"),
+                ErrorKind::InvalidToken => tracing::error!("Token is invalid"),
+                ErrorKind::InvalidIssuer => tracing::error!("Issuer is invalid"),
                 _ => (),
             };
 
@@ -396,7 +233,6 @@ async fn signin(
 
     return Ok(Response::builder()
         .status(StatusCode::OK)
-        .header("location", "/")
         .header("content-type", "text/html; charset=utf-8")
         .body(Body::from(app_state.static_pages.unauthenticated))?);
 }
@@ -484,27 +320,4 @@ async fn proxy_authenticate(
     return Ok(Response::builder()
         .status(StatusCode::OK)
         .body(Body::empty())?);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_host_domain_with_subdomain() {
-        let result = parse_host_domain("public.example.com");
-        assert_eq!(result, ".example.com");
-    }
-
-    #[test]
-    fn test_parse_host_domain_with_regular_domain() {
-        let result = parse_host_domain("example.com");
-        assert_eq!(result, ".example.com");
-    }
-
-    #[test]
-    fn test_parse_host_domain_with_localhost() {
-        let result = parse_host_domain("localhost");
-        assert_eq!(result, "localhost");
-    }
 }
