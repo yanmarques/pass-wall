@@ -2,7 +2,7 @@ use std::{net::SocketAddr, path::Path, str::FromStr, sync::Arc};
 
 use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use hyper::StatusCode;
-use pass_wall::{AccessControlConfig, Config, Policy, User};
+use pass_wall::{AccessControlConfig, Config, User};
 use reqwest::{
     Client, RequestBuilder, Url,
     cookie::{CookieStore, Jar},
@@ -25,11 +25,6 @@ enum Expect {
 }
 
 enum Subdomains {
-    Include,
-    Exclude,
-}
-
-enum Siblings {
     Include,
     Exclude,
 }
@@ -189,18 +184,13 @@ fn new_subdomain(subdomain: &str, basedomain: &str) -> String {
     format!("{subdomain}.{basedomain}")
 }
 
-fn default_config(subdomains: Subdomains, siblings: Siblings) -> Config {
+fn default_config(subdomains: Subdomains) -> Config {
     let mut config = Config::default();
     config.users = Vec::from_iter([new_user(DEFAULT_USER, DEFAULT_PASSWORD)]);
     config.acl = Vec::from_iter([AccessControlConfig {
         host: String::from(DEFAULT_HOST),
-        host_is_subdomain: true,
+        base_domain: None,
         include_subdomains: if let Subdomains::Include = subdomains {
-            true
-        } else {
-            false
-        },
-        include_siblings: if let Siblings::Include = siblings {
             true
         } else {
             false
@@ -251,7 +241,7 @@ async fn build_client(config: &Config) -> anyhow::Result<TestClient> {
 
 #[tokio::test]
 async fn test_authorizes_user() -> anyhow::Result<()> {
-    let config = default_config(Subdomains::Include, Siblings::Include);
+    let config = default_config(Subdomains::Include);
     let mut client = build_client(&config).await?;
     client
         .signin(
@@ -271,7 +261,7 @@ async fn test_authorizes_user() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_rejects_invalid_password() -> anyhow::Result<()> {
-    let config = default_config(Subdomains::Include, Siblings::Include);
+    let config = default_config(Subdomains::Include);
     let mut client = build_client(&config).await?;
 
     client
@@ -288,7 +278,7 @@ async fn test_rejects_invalid_password() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_rejects_invalid_credentials() -> anyhow::Result<()> {
-    let config = default_config(Subdomains::Include, Siblings::Include);
+    let config = default_config(Subdomains::Include);
     let mut client = build_client(&config).await?;
     client
         .signin(Expect::Failure, DEFAULT_HOST, "user123", "notthepassword")
@@ -299,7 +289,7 @@ async fn test_rejects_invalid_credentials() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_rejects_valid_credentials_unauthorized_host() -> anyhow::Result<()> {
-    let config = default_config(Subdomains::Exclude, Siblings::Exclude);
+    let config = default_config(Subdomains::Exclude);
     let mut client = build_client(&config).await?;
     client
         .signin(
@@ -314,7 +304,7 @@ async fn test_rejects_valid_credentials_unauthorized_host() -> anyhow::Result<()
 
 #[tokio::test]
 async fn test_rejects_host_impersonation() -> anyhow::Result<()> {
-    let config = default_config(Subdomains::Include, Siblings::Include);
+    let config = default_config(Subdomains::Include);
     let mut client = build_client(&config).await?;
     client
         .signin(
@@ -331,101 +321,6 @@ async fn test_rejects_host_impersonation() -> anyhow::Result<()> {
 
     client
         .check_proxy_auth(Expect::Failure, "another.domain.com")
-        .await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_acl_exclude_subdomains_include_siblings() -> anyhow::Result<()> {
-    let config = default_config(Subdomains::Exclude, Siblings::Include);
-    eprintln!("{:?}", Policy::try_from(config.clone())?);
-    let mut client = build_client(&config).await?;
-    let resp = client
-        .signin(
-            Expect::Success,
-            DEFAULT_HOST,
-            DEFAULT_USER,
-            DEFAULT_PASSWORD,
-        )
-        .await?;
-
-    assert!(
-        resp.headers()
-            .get("set-cookie")
-            .and_then(|header| header.to_str().ok())
-            .and_then(|set_cookie| cookie::Cookie::parse_encoded(set_cookie).ok())
-            .and_then(|cookie| Some(cookie.domain() == Some(DEFAULT_DOMAIN)))
-            .unwrap()
-    );
-
-    let resp = client
-        .signin(
-            Expect::Success,
-            &new_subdomain("sub", DEFAULT_DOMAIN),
-            DEFAULT_USER,
-            DEFAULT_PASSWORD,
-        )
-        .await?;
-
-    assert!(
-        resp.headers()
-            .get("set-cookie")
-            .and_then(|header| header.to_str().ok())
-            .and_then(|set_cookie| cookie::Cookie::parse_encoded(set_cookie).ok())
-            .and_then(|cookie| Some(cookie.domain() == Some(DEFAULT_DOMAIN)))
-            .unwrap()
-    );
-
-    client
-        .signin(
-            Expect::Failure,
-            &new_subdomain("sub", DEFAULT_HOST),
-            DEFAULT_USER,
-            DEFAULT_PASSWORD,
-        )
-        .await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_acl_exclude_subdomains_exclude_siblings() -> anyhow::Result<()> {
-    let config = default_config(Subdomains::Exclude, Siblings::Exclude);
-    let mut client = build_client(&config).await?;
-    let resp = client
-        .signin(
-            Expect::Success,
-            DEFAULT_HOST,
-            DEFAULT_USER,
-            DEFAULT_PASSWORD,
-        )
-        .await?;
-
-    assert!(
-        resp.headers()
-            .get("set-cookie")
-            .and_then(|header| header.to_str().ok())
-            .and_then(|set_cookie| cookie::Cookie::parse_encoded(set_cookie).ok())
-            .and_then(|cookie| Some(cookie.domain().is_none()))
-            .unwrap()
-    );
-
-    client
-        .signin(
-            Expect::Failure,
-            &new_subdomain("sub", DEFAULT_HOST),
-            DEFAULT_USER,
-            DEFAULT_PASSWORD,
-        )
-        .await?;
-    client
-        .signin(
-            Expect::Failure,
-            &new_subdomain("sub", DEFAULT_DOMAIN),
-            DEFAULT_USER,
-            DEFAULT_PASSWORD,
-        )
         .await?;
 
     Ok(())
