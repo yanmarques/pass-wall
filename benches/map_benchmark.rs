@@ -1,20 +1,18 @@
-use std::time::Duration;
-
 use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use axum::{body::Body, http::Request};
 use cookie::Cookie;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use pass_wall::{AccessControlConfig, Config, Host, Policy, User};
-use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
+use pass_wall::{AccessControlConfig, Config, Policy, User};
+use rand::{RngCore, SeedableRng, rngs::StdRng};
 use tokio::runtime::Runtime;
 use tower::ServiceExt;
 
 const DEFAULT_PASSWORD: &str = "admin";
 
-fn policy_test(user: &User, acls: &[AccessControlConfig]) -> Policy {
-    let mut hosts = rustc_hash::FxHashMap::default();
+pub fn policy_test(user: &User, acls: &[AccessControlConfig]) -> Policy {
+    let mut hosts = Vec::with_capacity(acls.len());
     for acl in acls.iter() {
-        hosts.insert(acl.host.clone(), Host::from(acl.host.clone(), &acl));
+        hosts.push(acl.host.clone());
     }
 
     let policy = Policy {
@@ -22,11 +20,6 @@ fn policy_test(user: &User, acls: &[AccessControlConfig]) -> Policy {
         authorized_hosts: rustc_hash::FxHashMap::from_iter([(user.name.clone(), hosts)]),
     };
     return policy;
-}
-
-fn generate_policy_test(user: &User, length: usize) -> anyhow::Result<Policy> {
-    let acls = generate_acls(user, length)?;
-    return Ok(policy_test(user, &acls));
 }
 
 fn generate_acls(user: &User, length: usize) -> anyhow::Result<Vec<AccessControlConfig>> {
@@ -48,18 +41,11 @@ fn generate_acls(user: &User, length: usize) -> anyhow::Result<Vec<AccessControl
 
         acls.push(AccessControlConfig {
             host: subs.join("."),
-            host_is_subdomain: rng.random(),
-            include_subdomains: rng.random(),
-            include_siblings: rng.random(),
             allowed_users: vec![user.name.clone()],
         });
     }
 
     Ok(acls)
-}
-
-fn bench_policy_authorize(user: &User, policy: &Policy) {
-    black_box(policy.authorize(&user.name, "sub.example.com"));
 }
 
 async fn bench_app_signin(config: &Config, user: &str, password: &str) {
@@ -111,38 +97,6 @@ fn criterion_benchmark(c: &mut Criterion) {
             .to_string(),
     };
     let rt = Runtime::new().expect("span new runtime");
-
-    let mut group = c.benchmark_group("Policy::authorize");
-    group.bench_function("length-100", |b| {
-        b.iter_batched(
-            || generate_policy_test(&user, 100).expect("generate policy test"),
-            |policy| bench_policy_authorize(black_box(&user.clone()), black_box(&policy)),
-            criterion::BatchSize::LargeInput,
-        );
-    });
-    group.finish();
-
-    let mut group = c.benchmark_group("Policy::authorize");
-    group.bench_function("length-10000", |b| {
-        b.iter_batched(
-            || generate_policy_test(&user, 10000).expect("generate policy test"),
-            |policy| bench_policy_authorize(black_box(&user.clone()), black_box(&policy)),
-            criterion::BatchSize::LargeInput,
-        );
-    });
-    group.finish();
-
-    let mut group = c.benchmark_group("Policy::authorize");
-    group.sample_size(50);
-    group.warm_up_time(Duration::from_secs(60));
-    group.bench_function("length-1000000", |b| {
-        b.iter_batched(
-            || generate_policy_test(&user, 1000000).expect("generate policy test"),
-            |policy| bench_policy_authorize(black_box(&user.clone()), black_box(&policy)),
-            criterion::BatchSize::LargeInput,
-        );
-    });
-    group.finish();
 
     let mut group = c.benchmark_group("app::flow");
     group.bench_function("length-100", |b| {

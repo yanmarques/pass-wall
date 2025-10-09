@@ -24,11 +24,6 @@ enum Expect {
     Success,
 }
 
-enum Subdomains {
-    Include,
-    Exclude,
-}
-
 struct TestClient {
     #[allow(dead_code)]
     container: ContainerAsync<GenericImage>,
@@ -108,17 +103,24 @@ impl TestClient {
                 assert_eq!(resp.headers().get("location").unwrap().to_str()?, &target);
 
                 // reqwest won't keep cookie because of domain mismatch, so we do the dirty job
-                let session_cookies = resp.headers().get("set-cookie");
-                assert_ne!(session_cookies, None);
-                let session = session_cookies
-                    .clone()
-                    .and_then(|cookie| cookie.to_str().ok())
-                    .and_then(|cookie| cookie.split_once(";"))
-                    .and_then(|fragments| fragments.0.split_once("="))
-                    .and_then(|fragments| Some(fragments.1))
-                    .unwrap();
+                let session_cookies = resp.headers().get_all("set-cookie");
+                for acl in &self.config.acl {
+                    let mut found = false;
+                    for session_cookie in &session_cookies {
+                        if let Ok(cookie) = session_cookie.to_str() {
+                            if let Ok(c) = cookie::Cookie::parse(cookie) {
+                                let domain = c.domain().unwrap();
+                                if acl.host == domain {
+                                    self.session = Some(c.value().to_string());
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
 
-                self.session = Some(String::from(session));
+                    assert!(found == true, "missing domain in cookie: {}", acl.host);
+                }
 
                 return Ok(resp);
             }
@@ -180,21 +182,11 @@ fn new_user(name: &str, password: &str) -> User {
     }
 }
 
-fn new_subdomain(subdomain: &str, basedomain: &str) -> String {
-    format!("{subdomain}.{basedomain}")
-}
-
-fn default_config(subdomains: Subdomains) -> Config {
+fn default_config() -> Config {
     let mut config = Config::default();
     config.users = Vec::from_iter([new_user(DEFAULT_USER, DEFAULT_PASSWORD)]);
     config.acl = Vec::from_iter([AccessControlConfig {
         host: String::from(DEFAULT_HOST),
-        base_domain: None,
-        include_subdomains: if let Subdomains::Include = subdomains {
-            true
-        } else {
-            false
-        },
         allowed_users: vec![String::from(DEFAULT_USER)],
     }]);
 
@@ -241,7 +233,7 @@ async fn build_client(config: &Config) -> anyhow::Result<TestClient> {
 
 #[tokio::test]
 async fn test_authorizes_user() -> anyhow::Result<()> {
-    let config = default_config(Subdomains::Include);
+    let config = default_config();
     let mut client = build_client(&config).await?;
     client
         .signin(
@@ -261,7 +253,7 @@ async fn test_authorizes_user() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_rejects_invalid_password() -> anyhow::Result<()> {
-    let config = default_config(Subdomains::Include);
+    let config = default_config();
     let mut client = build_client(&config).await?;
 
     client
@@ -278,7 +270,7 @@ async fn test_rejects_invalid_password() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_rejects_invalid_credentials() -> anyhow::Result<()> {
-    let config = default_config(Subdomains::Include);
+    let config = default_config();
     let mut client = build_client(&config).await?;
     client
         .signin(Expect::Failure, DEFAULT_HOST, "user123", "notthepassword")
@@ -288,13 +280,23 @@ async fn test_rejects_invalid_credentials() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_rejects_valid_credentials_unauthorized_host() -> anyhow::Result<()> {
-    let config = default_config(Subdomains::Exclude);
+async fn test_authorizes_every_domain_for_user() -> anyhow::Result<()> {
+    let mut config = default_config();
+    config.acl.push(AccessControlConfig {
+        host: "sub.other.com".to_string(),
+        allowed_users: Vec::from_iter([DEFAULT_USER.to_string()]),
+    });
+    config.acl.push(AccessControlConfig {
+        host: "another.com".to_string(),
+        allowed_users: Vec::from_iter([DEFAULT_USER.to_string()]),
+    });
+
     let mut client = build_client(&config).await?;
+
     client
         .signin(
-            Expect::Failure,
-            &new_subdomain("notexists", DEFAULT_DOMAIN),
+            Expect::Success,
+            DEFAULT_DOMAIN,
             DEFAULT_USER,
             DEFAULT_PASSWORD,
         )
@@ -303,25 +305,16 @@ async fn test_rejects_valid_credentials_unauthorized_host() -> anyhow::Result<()
 }
 
 #[tokio::test]
-async fn test_rejects_host_impersonation() -> anyhow::Result<()> {
-    let config = default_config(Subdomains::Include);
+async fn test_authorizes_and_ignores_host_header() -> anyhow::Result<()> {
+    let config = default_config();
     let mut client = build_client(&config).await?;
     client
         .signin(
             Expect::Success,
-            DEFAULT_HOST,
+            "notexists.com",
             DEFAULT_USER,
             DEFAULT_PASSWORD,
         )
         .await?;
-
-    client
-        .check_proxy_auth(Expect::Success, DEFAULT_HOST)
-        .await?;
-
-    client
-        .check_proxy_auth(Expect::Failure, "another.domain.com")
-        .await?;
-
     Ok(())
 }

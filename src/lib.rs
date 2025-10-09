@@ -52,88 +52,11 @@ impl<'a> Debug for User {
     }
 }
 
-/// View representation of a domain name.
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub struct DomainName<'d> {
-    pub name: &'d str,
-    pub domain: &'d str,
-    pub domain_ndots: usize,
-    pub subdomains: &'d str,
-    pub subdomains_ndots: usize,
-    pub ndots: usize,
-}
-
-impl<'d> DomainName<'d> {
-    /// Parse name into a domain name structure best used for efficient cached domain comparison.
-    ///
-    /// Optionally specify a `domain` to be used as the base domain during parsing. Alternatively,
-    /// one can specify a `domain_ndots` which overrides the default of one dot (ie, two
-    /// hierarchical DNS levels) when parsing the given `name`.
-    pub fn from(name: &'d str, domain: Option<&'d String>, domain_ndots: Option<usize>) -> Self {
-        let (ndots, default_domain, actual_domain_ndots, default_subdomains, subdomains_ndots) =
-            find_ndots(name, domain_ndots.unwrap_or(1));
-
-        if let Some(d) = domain {
-            let d_ndots = d.as_bytes().iter().filter(|c| **c == 46).count();
-            return Self::from(d, None, Some(d_ndots));
-        };
-
-        Self {
-            domain: default_domain,
-            domain_ndots: actual_domain_ndots,
-            subdomains: default_subdomains,
-            subdomains_ndots,
-            name,
-            ndots,
-        }
-    }
-}
-
-/// Allowed host
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub struct Host {
-    /// Original host value from the configuration.
-    pub value: String,
-    /// Domain used in the session cookie.
-    pub domain: String,
-    pub domain_ndots: usize,
-    pub subdomains: String,
-    pub subdomains_ndots: usize,
-    pub ndots: usize,
-    pub include_subdomains: bool,
-}
-
-impl Host {
-    pub fn from(value: String, acl: &AccessControlConfig) -> Self {
-        let domain_name = DomainName::from(&value, acl.base_domain.as_ref(), None);
-
-        Self {
-            domain: domain_name.domain.to_string(),
-            ndots: domain_name.ndots,
-            domain_ndots: domain_name.domain_ndots,
-            subdomains: domain_name.subdomains.to_string(),
-            subdomains_ndots: domain_name.subdomains_ndots,
-            value,
-            include_subdomains: acl.include_subdomains,
-        }
-    }
-
-    /// Get appropriate value for a cookie 'Domain' attribute. It does not guarantee proper access
-    /// control to the given host.
-    pub fn cookie_domain(&self) -> &String {
-        if self.include_subdomains {
-            return &self.domain;
-        }
-
-        return &self.value;
-    }
-}
-
 /// Define who and what can be access and be accessed
 #[derive(Clone, Debug)]
 pub struct Policy {
     pub users: rustc_hash::FxHashMap<String, User>,
-    pub authorized_hosts: rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<String, Host>>,
+    pub authorized_hosts: rustc_hash::FxHashMap<String, Vec<String>>,
 }
 
 impl Policy {
@@ -141,45 +64,8 @@ impl Policy {
     /// defined policy.
     ///
     /// Returns [`None`] otherwise.
-    pub fn authorize<H>(&self, user: &String, header_host: H) -> Option<&Host>
-    where
-        H: AsRef<str>,
-    {
-        return self.authorized_hosts.get(user).and_then(|hosts| {
-            if let Some(host) = hosts.get(header_host.as_ref()) {
-                return Some(host);
-            }
-
-            // TODO: use caching and an efficient domain comparison algorithm
-            for host in hosts.values() {
-                if host.include_subdomains {
-                    let untrusted_dn =
-                        DomainName::from(header_host.as_ref(), None, Some(host.domain_ndots));
-
-                    if host.domain != untrusted_dn.domain {
-                        continue;
-                    }
-
-                    if untrusted_dn.subdomains_ndots == 0 || untrusted_dn.subdomains == "" {
-                        continue;
-                    }
-
-                    if let Some(available_subs) = untrusted_dn
-                        .subdomains_ndots
-                        .checked_sub(host.subdomains_ndots)
-                    {
-                        if available_subs == 1
-                            && untrusted_dn.subdomains.len() > (host.subdomains.len() + 1)
-                            && untrusted_dn.subdomains.ends_with(&host.subdomains)
-                        {
-                            return Some(&host);
-                        }
-                    }
-                }
-            }
-
-            return None;
-        });
+    pub fn authorize(&self, user: &String) -> Option<&Vec<String>> {
+        return self.authorized_hosts.get(user);
     }
 }
 
@@ -189,14 +75,6 @@ pub struct AccessControlConfig {
     /// The host. It can be a subdomain or a base domain, and it may include a port. It must not include
     /// schemes (e.g.: https:// or http://).
     pub host: String,
-    /// Whether to authorize users access to any subdomain in the host's domain, if a subdomain. Effectively, this
-    /// controls which 'Domain' used in the session cookie. If false, the cookie 'Domain' attribute
-    /// will match the host only, and not it's domain (if it is a subdomain).
-    pub include_subdomains: bool,
-    /// Override the default base domain identification. The base domain is automatically extracted
-    /// with only two labels by default (e.g.: example.com). Base domains with more than two labels,
-    /// should specify `base_domain` (e.g.: example.co.uk)
-    pub base_domain: Option<String>,
     /// All users authorized to access the host. If `include_subdomain` is true, also authorize
     /// users to access all subdomain's of the host's domain (only if a subdomain).
     pub allowed_users: Vec<String>,
@@ -379,8 +257,7 @@ impl TryFrom<Config> for Policy {
             );
         }
 
-        let mut authorized_hosts =
-            rustc_hash::FxHashMap::<String, rustc_hash::FxHashMap<String, Host>>::default();
+        let mut authorized_hosts = rustc_hash::FxHashMap::<String, Vec<String>>::default();
 
         for access_control in &value.acl {
             if access_control.host.is_empty() {
@@ -406,17 +283,11 @@ impl TryFrom<Config> for Policy {
                 };
 
                 if let Some(hosts) = authorized_hosts.get_mut(&user.name) {
-                    hosts.insert(
-                        access_control.host.clone(),
-                        Host::from(access_control.host.clone(), &access_control),
-                    );
+                    hosts.push(access_control.host.clone());
                 } else {
                     authorized_hosts.insert(
                         user.name.clone(),
-                        rustc_hash::FxHashMap::from_iter([(
-                            access_control.host.clone(),
-                            Host::from(access_control.host.clone(), &access_control),
-                        )]),
+                        Vec::from_iter([access_control.host.clone()]),
                     );
                 }
             }
@@ -427,52 +298,6 @@ impl TryFrom<Config> for Policy {
             authorized_hosts,
         })
     }
-}
-
-pub(crate) fn find_ndots<'e>(
-    host: &'e str,
-    domain_ndots: usize,
-) -> (usize, &'e str, usize, &'e str, usize) {
-    if host.len() == 0 || domain_ndots == 0 || !host.is_ascii() {
-        return (0, "", 0, "", 0);
-    }
-
-    let mut domain_ndots_count = 0;
-    let mut index = host.len();
-    let mut domain_dot_idx = None;
-    let mut subdomain_dot_idx = None;
-    let mut subdomains_ndots = 0;
-    let mut ndots = 0;
-
-    for c in host.chars().rev() {
-        index -= 1;
-        if c == '.' {
-            ndots += 1;
-            if let None = domain_dot_idx {
-                domain_ndots_count += 1;
-                if domain_ndots_count >= domain_ndots {
-                    domain_dot_idx = Some(index);
-                }
-            } else {
-                subdomains_ndots += 1;
-                if let None = subdomain_dot_idx {
-                    subdomain_dot_idx = Some(index);
-                }
-            }
-        }
-    }
-
-    if let Some(subdomain_idx) = subdomain_dot_idx {
-        return (
-            ndots,
-            &host[subdomain_idx + 1..],
-            domain_ndots_count,
-            &host[..subdomain_idx],
-            subdomains_ndots,
-        );
-    }
-
-    return (ndots, host, domain_ndots_count, "", subdomains_ndots);
 }
 
 pub fn app(config: &Config) -> anyhow::Result<Router> {
@@ -547,11 +372,8 @@ async fn signin(
     };
 
     if let Some(user) = app_state.policy.users.get(&input.name) {
-        if let Ok(uri) = Uri::try_from(&redirect) {
-            let header_host = uri
-                .host()
-                .ok_or_else(|| anyhow::anyhow!("invalid redirect host"))?;
-            if let Some(host) = app_state.policy.authorize(&user.name, header_host) {
+        if Uri::try_from(&redirect).is_ok() {
+            if let Some(hosts) = app_state.policy.authorize(&user.name) {
                 let parsed_hash = PasswordHash::new(&user.password_hash).map_err(|err| {
                     tracing::error!(?err, "failed to parse user's password hash");
                     return anyhow::anyhow!("failed to parse user's password");
@@ -573,17 +395,23 @@ async fn signin(
                         &app_state.encoding_key,
                     )?;
 
-                    let set_cookie = cookie::Cookie::build((&app_state.session.cookie_name, token))
-                        .secure(!app_state.session.insecure_http)
-                        .http_only(!app_state.session.disable_secure_http_only)
-                        .domain(host.cookie_domain())
-                        .same_site(app_state.session.same_site.to_cookie_samesite());
-
-                    return Ok(Response::builder()
+                    let mut response_builder = Response::builder()
                         .status(StatusCode::FOUND)
-                        .header("location", redirect)
-                        .header("set-cookie", set_cookie.to_string())
-                        .body(Body::empty())?);
+                        .header("location", redirect);
+
+                    for host in hosts {
+                        let set_cookie =
+                            cookie::Cookie::build((&app_state.session.cookie_name, &token))
+                                .secure(!app_state.session.insecure_http)
+                                .http_only(!app_state.session.disable_secure_http_only)
+                                .domain(host)
+                                .same_site(app_state.session.same_site.to_cookie_samesite());
+
+                        response_builder =
+                            response_builder.header("set-cookie", set_cookie.to_string());
+                    }
+
+                    return Ok(response_builder.body(Body::empty())?);
                 }
             }
         }
@@ -612,12 +440,7 @@ async fn show_signin(
         .and_then(|user| app_state.policy.users.get(&user));
 
     if let Some(user) = authenticated_user {
-        if let Some(_host) = app_state.policy.authorize(
-            &user.name,
-            redirect
-                .host()
-                .ok_or_else(|| anyhow::anyhow!("invalid redirect host"))?,
-        ) {
+        if let Some(_hosts) = app_state.policy.authorize(&user.name) {
             return Ok(Response::builder()
                 .status(StatusCode::FOUND)
                 .header("location", redirect.to_string())
@@ -661,9 +484,7 @@ async fn proxy_authenticate(
         .and_then(|user| app_state.policy.users.get(&user))
         .and_then(|authenticated_user| {
             tracing::debug!(user = authenticated_user.name, header_host, "authenticated");
-            app_state
-                .policy
-                .authorize(&authenticated_user.name, &header_host)
+            app_state.policy.authorize(&authenticated_user.name)
         });
 
     if authorized_hosts.is_none() {
@@ -678,9 +499,9 @@ async fn proxy_authenticate(
 }
 
 pub fn policy_test(user: &User, acls: &[AccessControlConfig]) -> Policy {
-    let mut hosts = rustc_hash::FxHashMap::default();
+    let mut hosts = Vec::with_capacity(acls.len());
     for acl in acls.iter() {
-        hosts.insert(acl.host.clone(), Host::from(acl.host.clone(), &acl));
+        hosts.push(acl.host.clone());
     }
 
     let policy = Policy {
@@ -695,153 +516,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_domain_name_with_exact_custom_domain() {
-        let domain = "example.com".to_string();
-        let result = DomainName::from(&domain, Some(&domain), None);
-        assert_eq!(result.ndots, 1);
-        assert_eq!(result.domain, "example.com");
-        assert_eq!(result.domain_ndots, 1);
-        assert_eq!(result.subdomains, "");
-        assert_eq!(result.subdomains_ndots, 0);
-    }
-
-    #[test]
-    fn test_parse_domain_name_as_subdomain_with_custom_domain() {
-        let domain = "example.com".to_string();
-        let result = DomainName::from("sub.example.com", Some(&domain), None);
-        assert_eq!(result.ndots, 1);
-        assert_eq!(result.domain, "example.com");
-        assert_eq!(result.domain_ndots, 1);
-        assert_eq!(result.subdomains, "sub");
-        assert_eq!(result.subdomains_ndots, 1);
-    }
-
-    #[test]
-    fn test_parse_host_domain_with_multi_level_subdomains() {
-        let result = DomainName::from("foo.public.example.com", None, None);
-        assert_eq!(result.ndots, 3);
-        assert_eq!(result.domain, "example.com");
-        assert_eq!(result.domain_ndots, 1);
-        assert_eq!(result.subdomains, "foo.public");
-        assert_eq!(result.subdomains_ndots, 2);
-    }
-
-    #[test]
-    fn test_parse_host_domain_with_multi_level_subdomains_with_custom_ndot() {
-        let result = DomainName::from("foo.public.example.com", None, Some(2));
-        assert_eq!(result.ndots, 3);
-        assert_eq!(result.domain, "public.example.com");
-        assert_eq!(result.domain_ndots, 2);
-        assert_eq!(result.subdomains, "foo");
-        assert_eq!(result.subdomains_ndots, 1);
-    }
-
-    #[test]
-    fn test_parse_host_domain_with_subdomain() {
-        let result = DomainName::from("public.example.com", None, None);
-        assert_eq!(result.ndots, 2);
-        assert_eq!(result.domain, "example.com");
-        assert_eq!(result.domain_ndots, 1);
-        assert_eq!(result.subdomains, "public");
-        assert_eq!(result.subdomains_ndots, 1);
-    }
-
-    #[test]
-    fn test_parse_host_domain_with_subdomain_with_custom_ndot() {
-        let result = DomainName::from("public.example.com", None, Some(2));
-        assert_eq!(result.ndots, 2);
-        assert_eq!(result.domain, "public.example.com");
-        assert_eq!(result.domain_ndots, 2);
-        assert_eq!(result.subdomains, "");
-        assert_eq!(result.subdomains_ndots, 0);
-    }
-
-    #[test]
-    fn test_parse_host_domain_with_regular_domain() {
-        let result = DomainName::from("example.com", None, None);
-        assert_eq!(result.ndots, 1);
-        assert_eq!(result.domain, "example.com");
-        assert_eq!(result.domain_ndots, 1);
-        assert_eq!(result.subdomains, "");
-        assert_eq!(result.subdomains_ndots, 0);
-    }
-
-    #[test]
-    fn test_parse_host_domain_with_regular_domain_with_custom_ndot() {
-        let result = DomainName::from("example.com", None, Some(2));
-        assert_eq!(result.ndots, 1);
-        assert_eq!(result.domain, "example.com");
-        assert_eq!(result.domain_ndots, 1);
-        assert_eq!(result.subdomains, "");
-        assert_eq!(result.subdomains_ndots, 0);
-    }
-
-    #[test]
-    fn test_parse_host_domain_with_localhost() {
-        let result = DomainName::from("localhost", None, None);
-        assert_eq!(result.ndots, 0);
-        assert_eq!(result.domain, "localhost");
-        assert_eq!(result.domain_ndots, 0);
-        assert_eq!(result.subdomains, "");
-        assert_eq!(result.subdomains_ndots, 0);
-    }
-
-    #[test]
-    fn test_parse_host_domain_with_localhost_with_custom_ndot() {
-        let result = DomainName::from("localhost", None, Some(1));
-        assert_eq!(result.ndots, 0);
-        assert_eq!(result.domain, "localhost");
-        assert_eq!(result.domain_ndots, 0);
-        assert_eq!(result.subdomains, "");
-        assert_eq!(result.subdomains_ndots, 0);
-    }
-
-    #[test]
-    fn test_authorize_policy_against_bypass_through_subdomain_confusion() {
-        let user = User {
-            name: String::from("admin"),
-            password_hash: String::new(),
-        };
-
-        let policy = policy_test(
-            &user,
-            &[AccessControlConfig {
-                host: String::from("localhost"),
-                base_domain: None,
-                include_subdomains: true,
-                allowed_users: vec![],
-            }],
-        );
-
-        assert!(policy.authorize(&user.name, "localhost").is_some());
-        assert!(policy.authorize(&user.name, "another").is_none());
-        assert!(policy.authorize(&user.name, "localhost.another").is_none());
-
-        let policy = policy_test(
-            &user,
-            &[AccessControlConfig {
-                host: String::from("public.example.com"),
-                base_domain: None,
-                include_subdomains: true,
-                allowed_users: vec![],
-            }],
-        );
-
-        assert!(
-            policy
-                .authorize(&user.name, "nested.public.example.com")
-                .is_some()
-        );
-        assert!(
-            policy
-                .authorize(&user.name, "nested.another.example.com")
-                .is_none()
-        );
-        assert!(policy.authorize(&user.name, ".example.com").is_none());
-        assert_eq!(policy.authorize(&user.name, ".public.example.com"), None);
-    }
-
-    #[test]
     fn test_authorize_policy() {
         let user = User {
             name: String::from("admin"),
@@ -852,159 +526,12 @@ mod tests {
             &user,
             &[AccessControlConfig {
                 host: String::from("example.com"),
-                base_domain: None,
-                include_subdomains: false,
                 allowed_users: vec![],
             }],
         );
 
-        assert!(policy.authorize(&user.name, "example.com").is_some());
-        assert!(policy.authorize(&user.name, "domain.com").is_none());
-        assert!(policy.authorize(&user.name, "sub.example.com").is_none());
-        assert!(policy.authorize(&user.name, "another.domain.com").is_none());
-
-        let policy = policy_test(
-            &user,
-            &[AccessControlConfig {
-                host: String::from("example.com"),
-                base_domain: None,
-                include_subdomains: true,
-                allowed_users: vec![],
-            }],
-        );
-
-        assert!(policy.authorize(&user.name, "example.com").is_some());
-        assert!(policy.authorize(&user.name, "sub.example.com").is_some());
-        assert!(
-            policy
-                .authorize(&user.name, "nested.sub.example.com")
-                .is_none()
-        );
-        assert!(policy.authorize(&user.name, "domain.com").is_none());
-        assert!(policy.authorize(&user.name, "another.domain.com").is_none());
-
-        let policy = policy_test(
-            &user,
-            &[AccessControlConfig {
-                host: String::from("sub.example.com"),
-                base_domain: None,
-                include_subdomains: true,
-                allowed_users: vec![],
-            }],
-        );
-
-        assert!(policy.authorize(&user.name, "sub.example.com").is_some());
-        assert!(
-            policy
-                .authorize(&user.name, "nested.sub.example.com")
-                .is_some()
-        );
-        assert!(
-            policy
-                .authorize(&user.name, "super.nested.sub.example.com")
-                .is_none()
-        );
-        assert!(policy.authorize(&user.name, "other.example.com").is_none());
-        assert!(policy.authorize(&user.name, "example.com").is_none());
-        assert!(policy.authorize(&user.name, "domain.com").is_none());
-        assert!(policy.authorize(&user.name, "another.domain.com").is_none());
-        assert!(
-            policy
-                .authorize(&user.name, "nested.another.domain.com")
-                .is_none()
-        );
-
-        let policy = policy_test(
-            &user,
-            &[AccessControlConfig {
-                host: String::from("sub.example.com"),
-                base_domain: None,
-                include_subdomains: false,
-                allowed_users: vec![],
-            }],
-        );
-
-        assert!(policy.authorize(&user.name, "sub.example.com").is_some());
-        assert!(
-            policy
-                .authorize(&user.name, "nested.sub.example.com")
-                .is_none()
-        );
-        assert!(
-            policy
-                .authorize(&user.name, "super.nested.sub.example.com")
-                .is_none()
-        );
-        assert!(policy.authorize(&user.name, "example.com").is_none());
-        assert!(policy.authorize(&user.name, "other.example.com").is_none());
-        assert!(policy.authorize(&user.name, "domain.com").is_none());
-        assert!(policy.authorize(&user.name, "another.domain.com").is_none());
-        assert!(
-            policy
-                .authorize(&user.name, "nested.another.domain.com")
-                .is_none()
-        );
-
-        let policy = policy_test(
-            &user,
-            &[AccessControlConfig {
-                host: String::from("sub.example.com"),
-                base_domain: Some("sub.example.com".to_string()),
-                include_subdomains: false,
-                allowed_users: vec![],
-            }],
-        );
-
-        assert!(policy.authorize(&user.name, "sub.example.com").is_some());
-        assert!(
-            policy
-                .authorize(&user.name, "nested.sub.example.com")
-                .is_none()
-        );
-        assert!(
-            policy
-                .authorize(&user.name, "super.nested.sub.example.com")
-                .is_none()
-        );
-        assert!(policy.authorize(&user.name, "example.com").is_none());
-        assert!(policy.authorize(&user.name, "other.example.com").is_none());
-        assert!(policy.authorize(&user.name, "domain.com").is_none());
-        assert!(policy.authorize(&user.name, "another.domain.com").is_none());
-        assert!(
-            policy
-                .authorize(&user.name, "nested.another.domain.com")
-                .is_none()
-        );
-
-        let policy = policy_test(
-            &user,
-            &[AccessControlConfig {
-                host: String::from("sub.example.com"),
-                base_domain: Some("sub.example.com".to_string()),
-                include_subdomains: true,
-                allowed_users: vec![],
-            }],
-        );
-
-        assert!(policy.authorize(&user.name, "sub.example.com").is_some());
-        assert!(
-            policy
-                .authorize(&user.name, "nested.sub.example.com")
-                .is_some()
-        );
-        assert!(
-            policy
-                .authorize(&user.name, "super.nested.sub.example.com")
-                .is_none()
-        );
-        assert!(policy.authorize(&user.name, "example.com").is_none());
-        assert!(policy.authorize(&user.name, "other.example.com").is_none());
-        assert!(policy.authorize(&user.name, "domain.com").is_none());
-        assert!(policy.authorize(&user.name, "another.domain.com").is_none());
-        assert!(
-            policy
-                .authorize(&user.name, "nested.another.domain.com")
-                .is_none()
-        );
+        let hosts = policy.authorize(&user.name);
+        assert_ne!(hosts, None);
+        assert_eq!(hosts.unwrap(), &["example.com"]);
     }
 }

@@ -11,8 +11,5 @@ users:
     password_hash: $argon2id$v=19$m=19456,t=2,p=1$IEgmAxZvkzsHx6FMnpQwdw$boMkRfsSnSYW7wPrp3R50n9FLciVTQZUOvX81G0HVd8
 acl:
   - host: public.example.com
-    host_is_subdomain: true
-    include_subdomains: false
-    include_siblings: true
     allowed_users:
     - admin
