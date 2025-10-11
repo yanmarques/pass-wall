@@ -1,0 +1,101 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pass-wall
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pass-wall
+  namespace: pass-wall
+data:
+  conf: |
+    app_bind: 0.0.0.0:9000
+    app_key: a1921950af955b4738d855f6b880c8951bfe4ff355ebd43369b38593432fc24a
+    session:
+      cookie_name: passwall_session
+      expiration_secs: 3600
+      same_site: strict
+      insecure_http: true
+      disable_secure_http_only: false
+    users:
+      - name: admin
+        password_hash: $argon2id$v=19$m=19456,t=2,p=1$IEgmAxZvkzsHx6FMnpQwdw$boMkRfsSnSYW7wPrp3R50n9FLciVTQZUOvX81G0HVd8
+    acl:
+      - host: example.com
+        allowed_users:
+        - admin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pass-wall
+  namespace: pass-wall
+  labels:
+    app: pass-wall
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: pass-wall
+  template:
+    metadata:
+      labels:
+        app: pass-wall
+    spec:
+      containers:
+      - name: pass-wall
+        image: localhost:5001/pass-wall:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 9000
+        env:
+          - name: RUST_LOG
+            value: pass_wall=trace
+        volumeMounts:
+        - name: config
+          mountPath: /passwall.yaml
+          subPath: conf
+          readOnly: true
+        resources:
+          limits:
+            cpu: 100m
+            memory: 256Mi
+      volumes:
+      - name: config
+        configMap:
+          name: pass-wall
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pass-wall
+  namespace: pass-wall
+spec:
+  type: ClusterIP
+  selector:
+    app: pass-wall
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 9000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pass-wall
+  namespace: pass-wall
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: auth.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service: 
+            name: pass-wall
+            port: 
+              number: 80

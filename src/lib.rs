@@ -374,13 +374,22 @@ async fn signin(
     if let Some(user) = app_state.policy.users.get(&input.name) {
         if Uri::try_from(&redirect).is_ok() {
             if let Some(hosts) = app_state.policy.authorize(&user.name) {
-                let parsed_hash = PasswordHash::new(&user.password_hash).map_err(|err| {
-                    tracing::error!(?err, "failed to parse user's password hash");
-                    return anyhow::anyhow!("failed to parse user's password");
-                })?;
+                let password_hash = user.password_hash.clone();
 
-                let crypto_op =
-                    Argon2::default().verify_password(input.password.as_bytes(), &parsed_hash);
+                let crypto_op = tokio::spawn(async move {
+                    let parsed_hash = PasswordHash::new(&password_hash).map_err(|err| {
+                        tracing::error!(?err, "failed to parse user's password hash");
+                        return anyhow::anyhow!("failed to parse user's password");
+                    })?;
+
+                    Argon2::default()
+                        .verify_password(input.password.as_bytes(), &parsed_hash)
+                        .map_err(|err| {
+                            tracing::error!(?err, "failed to verify user password");
+                            return anyhow::anyhow!("failed to verify user password");
+                        })
+                })
+                .await?;
 
                 if crypto_op.is_ok() {
                     let claims = Claims::new(
@@ -436,11 +445,10 @@ async fn show_signin(
     let authenticated_user = jar
         .get(&app_state.session.cookie_name)
         .and_then(|cookie| validate_token(cookie.value(), &app_state.decoding_key))
-        .and_then(|token| token.claims.user)
-        .and_then(|user| app_state.policy.users.get(&user));
+        .and_then(|token| token.claims.user);
 
     if let Some(user) = authenticated_user {
-        if let Some(_hosts) = app_state.policy.authorize(&user.name) {
+        if let Some(_hosts) = app_state.policy.authorize(&user) {
             return Ok(Response::builder()
                 .status(StatusCode::FOUND)
                 .header("location", redirect.to_string())
@@ -533,5 +541,7 @@ mod tests {
         let hosts = policy.authorize(&user.name);
         assert_ne!(hosts, None);
         assert_eq!(hosts.unwrap(), &["example.com"]);
+
+        assert_eq!(policy.authorize(&"not-admin".to_string()), None);
     }
 }
