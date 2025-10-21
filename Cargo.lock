@@ -1788,6 +1788,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_yaml_ng",
+ "subtle",
  "tempfile",
  "testcontainers",
  "tokio",

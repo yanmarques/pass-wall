@@ -19,12 +19,20 @@ use jsonwebtoken::{
 };
 use rand::{TryRngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
+// Internals
+pub const CSRF_TOKEN_COOKIE_NAME: &str = "csrf_token";
+
+// Config
 pub const DEFAULT_KEYSIZE: usize = 32;
 pub const DEFAULT_COOKIE_NAME: &str = "passwall_session";
 pub const DEFAULT_PORT: u16 = 9000;
+
+// Input validation
 pub const MAX_PASSWORD_LENGTH: usize = 256;
 pub const MAX_USER_LENGTH: usize = 256;
+pub const MAX_CSRF_TOKEN_LENGTH: usize = 32;
 pub const MAX_BODY_LENGTH: usize = (MAX_PASSWORD_LENGTH + MAX_USER_LENGTH) * 2;
 
 /// JWT claims
@@ -167,6 +175,7 @@ pub struct AppState {
 struct LoginInput {
     name: String,
     password: String,
+    csrf_token: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -314,6 +323,7 @@ pub fn app(config: &Config) -> anyhow::Result<Router> {
 
     let app = Router::new()
         .route("/", axum::routing::get(show_signin))
+        .route("/healthz", axum::routing::get(show_health))
         .route("/signin", axum::routing::post(signin))
         .route("/authenticate", axum::routing::get(proxy_authenticate))
         .with_state(AppState {
@@ -345,12 +355,27 @@ fn validate_token(token: &str, key: &DecodingKey) -> Option<TokenData<Claims>> {
     }
 }
 
+async fn show_health() -> Result<Response, AppError> {
+    return Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())?);
+}
+
 async fn signin(
     State(app_state): State<AppState>,
     jar: CookieJar,
     Form(input): Form<LoginInput>,
 ) -> Result<Response, AppError> {
-    if input.name.len() > MAX_USER_LENGTH || input.password.len() > MAX_PASSWORD_LENGTH {
+    if input.name.len() > MAX_USER_LENGTH
+        || input.password.len() > MAX_PASSWORD_LENGTH
+        || input.csrf_token.len() > MAX_CSRF_TOKEN_LENGTH
+    {
+        tracing::error!(
+            name_length = input.name.len(),
+            password_length = input.password.len(),
+            csrf_token_length = input.csrf_token.len(),
+            "received a signin form that is too large"
+        );
         return Ok(Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header("content-type", "text/html; charset=utf-8")
@@ -370,6 +395,20 @@ async fn signin(
                 .body(Body::empty())?);
         }
     };
+
+    let mut csrf_matches = false;
+    if let Some(csrf_cookie) = jar.get(CSRF_TOKEN_COOKIE_NAME) {
+        let csrf_from_cookie = csrf_cookie.value().as_bytes();
+        let csrf_from_form = input.csrf_token.as_bytes();
+        csrf_matches = csrf_from_cookie.ct_eq(csrf_from_form).unwrap_u8() == 1;
+    }
+
+    if csrf_matches == false {
+        return Ok(Response::builder()
+            .status(StatusCode::FOUND)
+            .header("location", "/")
+            .body(Body::empty())?);
+    }
 
     if let Some(user) = app_state.policy.users.get(&input.name) {
         if Uri::try_from(&redirect).is_ok() {
@@ -467,16 +506,28 @@ async fn show_signin(
         &app_state.encoding_key,
     )?;
 
-    let cookie = cookie::Cookie::build((&app_state.session.cookie_name, token))
+    let sess_cookie = cookie::Cookie::build((&app_state.session.cookie_name, token))
         .secure(!app_state.session.insecure_http)
         .http_only(!app_state.session.disable_secure_http_only)
         .same_site(app_state.session.same_site.to_cookie_samesite())
         .build();
 
+    let mut rng = rand::rngs::OsRng;
+    let mut csrf_token = [0u8; 16];
+    rng.try_fill_bytes(&mut csrf_token)
+        .expect("get random bytes");
+
+    let csrf_cookie = cookie::Cookie::build(("csrf_token", hex::encode(&csrf_token)))
+        .secure(!app_state.session.insecure_http)
+        .http_only(false)
+        .same_site(SameSite::Strict)
+        .build();
+
     return Ok(Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/html; charset=utf-8")
-        .header("set-cookie", cookie.to_string())
+        .header("set-cookie", sess_cookie.to_string())
+        .header("set-cookie", csrf_cookie.to_string())
         .body(Body::from(app_state.static_pages.login.clone()))?);
 }
 
