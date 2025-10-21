@@ -22,6 +22,7 @@ rpassword = "7.4.0"
 rustc-hash = "2.1.1"
 serde = { version = "1.0.219", default-features = false }
 serde_yaml_ng = "0.10.0"
+subtle = "2.6.1"
 tokio = { version = "1.44.1", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread", "time", "signal"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
