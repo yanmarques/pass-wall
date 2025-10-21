@@ -83,7 +83,7 @@ impl TestClient {
             cookie
                 .unwrap()
                 .to_str()?
-                .contains(&format!("{}=", self.config.session.cookie_name))
+                .contains(&format!("{}=", self.config.server.session.cookie_name))
         );
 
         let resp = self
@@ -145,7 +145,7 @@ impl TestClient {
                 "cookie",
                 format!(
                     "{}={}",
-                    self.config.session.cookie_name,
+                    self.config.server.session.cookie_name,
                     self.session.clone().unwrap(),
                 ),
             )
@@ -200,7 +200,7 @@ async fn build_client(config: &Config) -> anyhow::Result<TestClient> {
     let config_path = tmpdir.path().join("passwall.yml");
     std::fs::write(&config_path, policy_str)?;
 
-    let container_port = SocketAddr::from_str(&config.app_bind)?.port();
+    let container_port = SocketAddr::from_str(&config.server.bind)?.port();
     let container = GenericImage::new("debian", "bookworm")
         .with_exposed_port(container_port.tcp())
         .with_entrypoint("/pass-wall")

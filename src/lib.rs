@@ -8,6 +8,7 @@ use axum::{
     Form, Router,
     body::Body,
     extract::{Query, State},
+    http::HeaderMap,
     response::{IntoResponse, Response},
 };
 use axum_extra::extract::{CookieJar, Host as HeaderHost};
@@ -137,19 +138,29 @@ impl SessionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
+pub struct ServerConfig {
     /// Server listener address in the following format: HOST:PORT. Default is 0.0.0.0:9000
-    pub app_bind: String,
+    pub bind: String,
     /// A cryptographically secure key used to encrypt Json Web Tokens. It is important this key be
     /// generated correctly. Use the default generated config unless you know what you are doing.
     /// The default key generates 256 bits of entropy for the HMAC-SHA256 algorithm used in JWTs.
-    pub app_key: String,
+    pub key: String,
+    /// Session configuration.
+    pub session: SessionConfig,
+    /// A recommended defense-in-depth restriction of which origins are allowed to sign in.
+    /// Such verification is only applied when the "Origin" header is set in the request.
+    /// When empty, no verification is applied.
+    pub trusted_origins: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    /// Server specific configuration.
+    pub server: ServerConfig,
     /// Allowed users.
     pub users: Vec<User>,
     /// Access control per host and user.
     pub acl: Vec<AccessControlConfig>,
-    /// Session configuration.
-    pub session: SessionConfig,
 }
 
 /// All static pages
@@ -168,6 +179,7 @@ pub struct AppState {
     pub static_pages: StaticPages,
     pub policy: Policy,
     pub session: SessionConfig,
+    pub trusted_origins: rustc_hash::FxHashSet<String>,
 }
 
 /// Login form input
@@ -210,11 +222,14 @@ impl Config {
         let key = hex::encode(&bytes);
 
         Self {
-            app_bind: format!("0.0.0.0:{DEFAULT_PORT}"),
-            app_key: key,
+            server: ServerConfig {
+                bind: format!("0.0.0.0:{DEFAULT_PORT}"),
+                key: key,
+                trusted_origins: vec![],
+                session: SessionConfig::default(),
+            },
             users: vec![],
             acl: vec![],
-            session: SessionConfig::default(),
         }
     }
 }
@@ -319,7 +334,7 @@ pub fn app(config: &Config) -> anyhow::Result<Router> {
     let policy = Policy::try_from(config.clone())?;
     tracing::debug!(?policy, "runtime policy");
 
-    let app_key_bytes = config.app_key.as_bytes();
+    let app_key_bytes = config.server.key.as_bytes();
 
     let app = Router::new()
         .route("/", axum::routing::get(show_signin))
@@ -331,7 +346,10 @@ pub fn app(config: &Config) -> anyhow::Result<Router> {
             static_pages,
             encoding_key: EncodingKey::from_secret(&app_key_bytes),
             decoding_key: DecodingKey::from_secret(&app_key_bytes),
-            session: config.session.clone(),
+            session: config.server.session.clone(),
+            trusted_origins: rustc_hash::FxHashSet::from_iter(
+                config.server.trusted_origins.clone(),
+            ),
         });
 
     return Ok(app);
@@ -364,6 +382,7 @@ async fn show_health() -> Result<Response, AppError> {
 async fn signin(
     State(app_state): State<AppState>,
     jar: CookieJar,
+    headers: HeaderMap,
     Form(input): Form<LoginInput>,
 ) -> Result<Response, AppError> {
     if input.name.len() > MAX_USER_LENGTH
@@ -380,6 +399,19 @@ async fn signin(
             .status(StatusCode::UNAUTHORIZED)
             .header("content-type", "text/html; charset=utf-8")
             .body(Body::from(app_state.static_pages.unauthenticated))?);
+    }
+
+    if let Some(header) = headers.get("origin") {
+        if let Some(false) = header
+            .to_str()
+            .ok()
+            .and_then(|origin| Some(app_state.trusted_origins.contains(origin)))
+        {
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("content-type", "text/html; charset=utf-8")
+                .body(Body::from(app_state.static_pages.unauthenticated))?);
+        }
     }
 
     let redirect = match jar

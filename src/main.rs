@@ -105,9 +105,12 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     )
     .context(format!("parse yaml config: {:?}", config_path))?;
 
-    let listener = tokio::net::TcpListener::bind(app_config.app_bind.clone())
+    let listener = tokio::net::TcpListener::bind(app_config.server.bind.clone())
         .await
-        .context(format!("start listener on addr: {}", app_config.app_bind))?;
+        .context(format!(
+            "start listener on addr: {}",
+            app_config.server.bind
+        ))?;
     tracing::info!("starting listener");
 
     let app = pass_wall::app(&app_config)?;
