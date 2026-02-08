@@ -95,10 +95,28 @@
 
 			<label for="password">Password</label>
 			<input type="password" id="password" name="password" required>
+			<input type="hidden" id="csrf_token" name="csrf_token" value="">
 
 			<button type="submit">Login</button>
 		</form>
 	</div>
+	<script type="text/javascript">
+		function getCookie(name) {
+			const cookies = document.cookie.split(';').map(c => c.trim());
+			for (const kv of cookies) {
+				if (!kv) continue;
+				const [k, ...v] = kv.split('=');
+				if (k === name) return decodeURIComponent(v.join('='));
+			}
+			return null;
+		}
+
+		const csrfToken = getCookie("csrf_token");
+		if (csrfToken !== null) {
+			const input = document.querySelector("#csrf_token");
+			input.setAttribute("value", csrfToken);
+		}
+	</script>
 </body>
 
 </html>
