@@ -52,6 +52,10 @@ spec:
       - name: pass-wall
         image: localhost:5001/pass-wall:latest
         imagePullPolicy: Always
+        resources:
+          limits:
+            cpu: 500m
+            memory: 256Mi
         ports:
         - containerPort: 9000
           name: http
@@ -60,24 +64,27 @@ spec:
             value: pass_wall=trace
         volumeMounts:
         - name: config
-          mountPath: /passwall.yaml
+          mountPath: /app/passwall.yaml
           subPath: conf
           readOnly: true
         resources:
+          requests:
+            cpu: 150m
+            memory: 256Mi
           limits:
-            cpu: 100m
+            cpu: 500m
             memory: 256Mi
         livenessProbe:
           httpGet:
             path: /healthz
             port: http
-          initialDelaySeconds: 3
+          initialDelaySeconds: 1
           periodSeconds: 3
         readinessProbe:
           httpGet:
-            path: /healthz
+            path: /readyz
             port: http
-          initialDelaySeconds: 3
+          initialDelaySeconds: 1
           periodSeconds: 3
       volumes:
       - name: config

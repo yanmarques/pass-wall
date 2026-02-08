@@ -3,7 +3,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
+use argon2::PasswordVerifier;
 use axum::{
     Form, Router,
     body::Body,
@@ -262,7 +262,7 @@ impl TryFrom<Config> for Policy {
                 ));
             }
 
-            if let Err(err) = PasswordHash::new(&user.password_hash) {
+            if let Err(err) = argon2::PasswordHash::new(&user.password_hash) {
                 let char = user.password_hash.chars().last();
                 return Err(anyhow::anyhow!(
                     "User password hash is invalid or malformed. Affected user: {}, password hash: ...{}, err: {:?}",
@@ -339,6 +339,7 @@ pub fn app(config: &Config) -> anyhow::Result<Router> {
     let app = Router::new()
         .route("/", axum::routing::get(show_signin))
         .route("/healthz", axum::routing::get(show_health))
+        .route("/readyz", axum::routing::get(show_health))
         .route("/signin", axum::routing::post(signin))
         .route("/authenticate", axum::routing::get(proxy_authenticate))
         .with_state(AppState {
@@ -422,9 +423,9 @@ async fn signin(
         Some(t) => t,
         None => {
             return Ok(Response::builder()
-                .status(StatusCode::FOUND)
-                .header("location", "/")
-                .body(Body::empty())?);
+                .status(StatusCode::UNAUTHORIZED)
+                .header("content-type", "text/html; charset=utf-8")
+                .body(Body::from(app_state.static_pages.unauthenticated))?);
         }
     };
 
@@ -437,9 +438,9 @@ async fn signin(
 
     if csrf_matches == false {
         return Ok(Response::builder()
-            .status(StatusCode::FOUND)
-            .header("location", "/")
-            .body(Body::empty())?);
+            .status(StatusCode::UNAUTHORIZED)
+            .header("content-type", "text/html; charset=utf-8")
+            .body(Body::from(app_state.static_pages.unauthenticated))?);
     }
 
     if let Some(user) = app_state.policy.users.get(&input.name) {
@@ -447,13 +448,13 @@ async fn signin(
             if let Some(hosts) = app_state.policy.authorize(&user.name) {
                 let password_hash = user.password_hash.clone();
 
-                let crypto_op = tokio::spawn(async move {
-                    let parsed_hash = PasswordHash::new(&password_hash).map_err(|err| {
+                let authed = tokio::task::spawn_blocking(move || {
+                    let parsed_hash = argon2::PasswordHash::new(&password_hash).map_err(|err| {
                         tracing::error!(?err, "failed to parse user's password hash");
                         return anyhow::anyhow!("failed to parse user's password");
                     })?;
 
-                    Argon2::default()
+                    argon2::Argon2::default()
                         .verify_password(input.password.as_bytes(), &parsed_hash)
                         .map_err(|err| {
                             tracing::error!(?err, "failed to verify user password");
@@ -462,37 +463,44 @@ async fn signin(
                 })
                 .await?;
 
-                if crypto_op.is_ok() {
-                    let claims = Claims::new(
-                        Some(user.name.clone()),
-                        None,
-                        app_state.session.expiration_secs,
-                    );
+                if let Err(err) = authed {
+                    tracing::error!(?err, "auth unsuccessful");
 
-                    let token = jsonwebtoken::encode(
-                        &Header::new(Algorithm::HS256),
-                        &claims,
-                        &app_state.encoding_key,
-                    )?;
-
-                    let mut response_builder = Response::builder()
-                        .status(StatusCode::FOUND)
-                        .header("location", redirect);
-
-                    for host in hosts {
-                        let set_cookie =
-                            cookie::Cookie::build((&app_state.session.cookie_name, &token))
-                                .secure(!app_state.session.insecure_http)
-                                .http_only(!app_state.session.disable_secure_http_only)
-                                .domain(host)
-                                .same_site(app_state.session.same_site.to_cookie_samesite());
-
-                        response_builder =
-                            response_builder.header("set-cookie", set_cookie.to_string());
-                    }
-
-                    return Ok(response_builder.body(Body::empty())?);
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .body(Body::from(app_state.static_pages.unauthenticated.clone()))?);
                 }
+
+                let claims = Claims::new(
+                    Some(user.name.clone()),
+                    None,
+                    app_state.session.expiration_secs,
+                );
+
+                let token = jsonwebtoken::encode(
+                    &Header::new(Algorithm::HS256),
+                    &claims,
+                    &app_state.encoding_key,
+                )?;
+
+                let mut response_builder = Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header("location", redirect);
+
+                for host in hosts {
+                    let set_cookie =
+                        cookie::Cookie::build((&app_state.session.cookie_name, &token))
+                            .secure(!app_state.session.insecure_http)
+                            .http_only(!app_state.session.disable_secure_http_only)
+                            .domain(host)
+                            .same_site(app_state.session.same_site.to_cookie_samesite());
+
+                    response_builder =
+                        response_builder.header("set-cookie", set_cookie.to_string());
+                }
+
+                return Ok(response_builder.body(Body::empty())?);
             }
         }
     }
@@ -510,6 +518,7 @@ async fn show_signin(
 ) -> Result<Response, AppError> {
     let redirect = signin_query
         .redirect
+        .as_ref()
         .and_then(|url| Uri::try_from(url).ok())
         .ok_or_else(|| AppError::from(anyhow::anyhow!("missing redirect query param")))?;
 
@@ -522,7 +531,12 @@ async fn show_signin(
         if let Some(_hosts) = app_state.policy.authorize(&user) {
             return Ok(Response::builder()
                 .status(StatusCode::FOUND)
-                .header("location", redirect.to_string())
+                .header(
+                    "location",
+                    signin_query
+                        .redirect
+                        .expect("should have redirect query string at this point"),
+                )
                 .body(Body::empty())?);
         }
     }
@@ -549,7 +563,7 @@ async fn show_signin(
     rng.try_fill_bytes(&mut csrf_token)
         .expect("get random bytes");
 
-    let csrf_cookie = cookie::Cookie::build(("csrf_token", hex::encode(&csrf_token)))
+    let csrf_cookie = cookie::Cookie::build((CSRF_TOKEN_COOKIE_NAME, hex::encode(&csrf_token)))
         .secure(!app_state.session.insecure_http)
         .http_only(false)
         .same_site(SameSite::Strict)
