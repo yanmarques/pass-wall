@@ -27,11 +27,6 @@
 			font-family: sans-serif;
 		}
 
-		.error-message {
-			color: #ff4d4f;
-			margin-bottom: 1rem;
-		}
-
 		.login-container {
 			padding: 2rem;
 			border-radius: 12px;
@@ -90,7 +85,7 @@
 	<div class="login-container">
 		<h2>Login</h2>
 		<form action="signin" method="POST">
-			<label for="username">Username</label>
+			<label for="name">Username</label>
 			<input autofocus type="text" id="name" name="name" required>
 
 			<label for="password">Password</label>
@@ -111,11 +106,13 @@
 			return null;
 		}
 
-		const csrfToken = getCookie("passwall_csrf_token");
-		if (csrfToken !== null) {
-			const input = document.querySelector("#csrf_token");
-			input.setAttribute("value", csrfToken);
-		}
+		window.addEventListener("load", (event) => {
+			const csrfToken = getCookie("passwall_csrf_token");
+			if (csrfToken !== null) {
+				const input = document.querySelector("#csrf_token");
+				input.setAttribute("value", csrfToken);
+			}
+		});
 	</script>
 </body>
 
