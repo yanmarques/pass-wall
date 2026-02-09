@@ -41,6 +41,7 @@ pub const MAX_CSRF_TOKEN_LENGTH: usize = 32;
 pub struct Claims {
     pub redirect: Option<String>,
     pub user: Option<String>,
+    pub csrf_token: Option<String>,
     pub exp: u64,
 }
 
@@ -151,10 +152,6 @@ pub struct ServerConfig {
     pub key: String,
     /// Session configuration.
     pub session: SessionConfig,
-    /// A recommended defense-in-depth restriction of which origins are allowed to sign in.
-    /// Such verification is only applied when the "Origin" header is set in the request.
-    /// When empty, no verification is applied.
-    pub trusted_origins: Vec<String>,
     /// The URL to redirect the authentication server can not figure out the URL the user aims to
     /// arrive. This usually happens when the user manually type the authentication URL, in which
     /// case, the server needs information of where to fall back.
@@ -191,8 +188,6 @@ pub struct AppState {
     pub policy: Policy,
     pub session: SessionConfig,
     pub fallback_url: String,
-    /// Define which Origins are allowed for any access.
-    pub trusted_origins: rustc_hash::FxHashSet<String>,
     /// During sign in, it performs password verification regardless of whether
     /// the given user exists or not. This is the hash used for the verification.
     pub dummy_passwd_hash: argon2::PasswordHash<'static>,
@@ -241,7 +236,6 @@ impl Config {
             server: ServerConfig {
                 bind: format!("0.0.0.0:{DEFAULT_PORT}"),
                 key: key,
-                trusted_origins: vec![],
                 session: SessionConfig::default(),
                 fallback_url: String::new(),
                 url_prefix: None,
@@ -253,17 +247,31 @@ impl Config {
 }
 
 impl Claims {
-    pub fn new(user: Option<String>, redirect: Option<String>, expire_in: u64) -> Self {
+    pub fn new(
+        user: Option<String>,
+        redirect: Option<String>,
+        csrf_token: Option<String>,
+        expire_in: u64,
+    ) -> Self {
         let expiration = SystemTime::now() + Duration::from_secs(expire_in);
 
         Claims {
             redirect,
             user,
+            csrf_token,
             exp: expiration
                 .duration_since(UNIX_EPOCH)
                 .expect("can not get current timestamp")
                 .as_secs(),
         }
+    }
+
+    pub fn redirect_and_csrf_token(&self) -> Option<(&String, &String)> {
+        self.redirect.as_ref().and_then(|redirect| {
+            self.csrf_token
+                .as_ref()
+                .and_then(|csrf_token| Some((redirect, csrf_token)))
+        })
     }
 }
 
@@ -369,9 +377,6 @@ pub fn app(config: &Config) -> anyhow::Result<Router> {
             decoding_key: jwt::DecodingKey::from_secret(&app_key_bytes),
             session: config.server.session.clone(),
             fallback_url: config.server.fallback_url.clone(),
-            trusted_origins: rustc_hash::FxHashSet::from_iter(
-                config.server.trusted_origins.clone(),
-            ),
             dummy_passwd_hash,
         });
 
@@ -385,7 +390,7 @@ pub fn app(config: &Config) -> anyhow::Result<Router> {
 /// Return whether the given token is a valid JWT token for the key
 fn validate_token(token: &str, key: &jwt::DecodingKey) -> Option<jwt::TokenData<Claims>> {
     let validation = jwt::Validation::new(jwt::Algorithm::HS256);
-    match jsonwebtoken::decode::<Claims>(token, key, &validation) {
+    match jwt::decode::<Claims>(token, key, &validation) {
         Ok(data) => Some(data),
         Err(err) => {
             tracing::error!(?err, "token is invalid");
@@ -400,6 +405,17 @@ fn validate_token(token: &str, key: &jwt::DecodingKey) -> Option<jwt::TokenData<
     }
 }
 
+// TODO: a base validation is required. do we need more?
+fn is_valid_redirect_uri(redirect_host: &str, acl: &[AccessControlConfig]) -> bool {
+    for acl_config in acl {
+        if redirect_host.ends_with(&acl_config.domain) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 async fn show_health() -> Result<Response, AppError> {
     return Ok(Response::builder()
         .status(StatusCode::OK)
@@ -409,64 +425,60 @@ async fn show_health() -> Result<Response, AppError> {
 async fn signin(
     State(app_state): State<AppState>,
     jar: CookieJar,
-    headers: HeaderMap,
     Form(input): Form<LoginInput>,
 ) -> Result<Response, AppError> {
     if input.name.len() > MAX_USER_LENGTH
         || input.password.len() > MAX_PASSWORD_LENGTH
         || input.csrf_token.len() > MAX_CSRF_TOKEN_LENGTH
     {
-        tracing::error!(
+        tracing::warn!(
             name_length = input.name.len(),
             password_length = input.password.len(),
             csrf_token_length = input.csrf_token.len(),
             "received a signin form that is too large"
         );
         return Ok(Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
             .header(http::header::CONTENT_TYPE, HTML_CTYPE)
-            .body(Body::from(app_state.static_pages.unauthenticated))?);
+            .body(Body::empty())?);
     }
 
-    if let Some(header) = headers.get(http::header::ORIGIN) {
-        if let Some(false) = header
-            .to_str()
-            .ok()
-            .and_then(|origin| Some(app_state.trusted_origins.contains(origin)))
-        {
-            return Ok(Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header(http::header::CONTENT_TYPE, HTML_CTYPE)
-                .body(Body::from(app_state.static_pages.unauthenticated))?);
-        }
-    }
-
-    let redirect = match jar
+    let jwt_claims = match jar
         .get(DEFAULT_PREAUTH_COOKIE_NAME)
+        .as_ref()
         .and_then(|preauth_cookie| validate_token(preauth_cookie.value(), &app_state.decoding_key))
-        .and_then(|preauth_token| preauth_token.claims.redirect)
+        .and_then(|preauth_token| Some(preauth_token.claims))
     {
-        Some(t) => t,
+        Some(j) => j,
         None => {
+            tracing::warn!("invalid pre-authentication JWT");
             return Ok(Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
+                .status(StatusCode::BAD_REQUEST)
                 .header(http::header::CONTENT_TYPE, HTML_CTYPE)
-                .body(Body::from(app_state.static_pages.unauthenticated))?);
+                .body(Body::empty())?);
         }
     };
 
-    let mut csrf_matches = false;
-    if let Some(csrf_cookie) = jar.get(CSRF_TOKEN_COOKIE_NAME) {
-        let csrf_from_cookie = csrf_cookie.value().as_bytes();
-        let csrf_from_form = input.csrf_token.as_bytes();
-        csrf_matches = csrf_from_cookie.ct_eq(csrf_from_form).unwrap_u8() == 1;
-    }
+    let (redirect_url, csrf_token) = match jwt_claims.redirect_and_csrf_token() {
+        Some(a) => a,
+        None => {
+            tracing::warn!("missing client JWT parameters");
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(http::header::CONTENT_TYPE, HTML_CTYPE)
+                .body(Body::empty())?);
+        }
+    };
 
-    if csrf_matches == false {
+    let csrf_from_cookie = csrf_token.as_bytes();
+    let csrf_from_form = input.csrf_token.as_bytes();
+
+    if csrf_from_cookie.ct_eq(csrf_from_form).unwrap_u8() != 1 {
+        tracing::warn!("CSRF failed");
         return Ok(Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
+            .status(StatusCode::BAD_REQUEST)
             .header(http::header::CONTENT_TYPE, HTML_CTYPE)
-            .body(Body::from(app_state.static_pages.unauthenticated))?);
+            .body(Body::empty())?);
     }
 
     if let Some(user) = app_state.policy.users.get(&input.name) {
@@ -489,17 +501,42 @@ async fn signin(
         .await?;
 
         if let Err(err) = authed {
-            tracing::error!(?err, "auth unsuccessful");
-
+            tracing::warn!(?err, "auth unsuccessful");
             return Ok(Response::builder()
-                .status(StatusCode::OK)
+                .status(StatusCode::UNAUTHORIZED)
                 .header(http::header::CONTENT_TYPE, HTML_CTYPE)
                 .body(Body::from(app_state.static_pages.unauthenticated.clone()))?);
         }
 
+        let redirect_uri = match Uri::try_from(redirect_url) {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    ?redirect_url,
+                    "invalid redirect url inside the jwt, aborting"
+                );
+
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(http::header::CONTENT_TYPE, HTML_CTYPE)
+                    .body(Body::empty())?);
+            }
+        };
+
         if let Some(hosts) = app_state.policy.authorize(&user.name) {
+            let redirect_host = redirect_uri.host().unwrap_or("");
+            if !is_valid_redirect_uri(redirect_host, hosts) {
+                tracing::warn!(?redirect_url, "redirect url is invalid, not proceeding");
+                return Ok(Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header(http::header::CONTENT_TYPE, HTML_CTYPE)
+                    .body(Body::empty())?);
+            }
+
             let claims = Claims::new(
                 Some(user.name.clone()),
+                None,
                 None,
                 app_state.session.expiration_secs,
             );
@@ -512,7 +549,7 @@ async fn signin(
 
             let mut response_builder = Response::builder()
                 .status(StatusCode::FOUND)
-                .header(http::header::LOCATION, redirect);
+                .header(http::header::LOCATION, redirect_url);
 
             for acl_config in hosts {
                 let set_cookie = cookie::Cookie::build((&app_state.session.cookie_name, &token))
@@ -529,6 +566,7 @@ async fn signin(
             return Ok(response_builder.body(Body::empty())?);
         }
 
+        tracing::warn!(user = user.name, "unauthorized user");
         return Ok(Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header(http::header::CONTENT_TYPE, HTML_CTYPE)
@@ -538,18 +576,16 @@ async fn signin(
     // resist user enumeration through timing attacks
     let _ = tokio::task::spawn_blocking(move || {
         let _ = argon2::Argon2::default()
-            .verify_password(input.password.as_bytes(), &app_state.dummy_passwd_hash)
-            .inspect_err(|err| {
-                tracing::error!(?err, "failed to verify dummy password");
-            });
+            .verify_password(input.password.as_bytes(), &app_state.dummy_passwd_hash);
     })
     .await
     .inspect_err(|err| {
-        tracing::error!(?err, "checking dummy password");
+        tracing::warn!(?err, "checking dummy password");
     });
 
+    tracing::warn!(user = input.name, "unknown user");
     return Ok(Response::builder()
-        .status(StatusCode::OK)
+        .status(StatusCode::UNAUTHORIZED)
         .header(http::header::CONTENT_TYPE, HTML_CTYPE)
         .body(Body::from(app_state.static_pages.unauthenticated.clone()))?);
 }
@@ -559,16 +595,23 @@ async fn show_signin(
     Query(signin_query): Query<SigninQuery>,
     jar: CookieJar,
 ) -> Result<Response, AppError> {
-    let redirect = match signin_query
-        .redirect
-        .as_ref()
-        .and_then(|url| Uri::try_from(url).ok())
-    {
+    let redirect_url = match signin_query.redirect {
         Some(r) => r,
         None => {
             return Ok(Response::builder()
                 .status(StatusCode::FOUND)
                 .header(http::header::LOCATION, &app_state.fallback_url)
+                .body(Body::empty())?);
+        }
+    };
+
+    let redirect_uri = match Uri::try_from(&redirect_url) {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(?err, ?redirect_url, "failed to parse url");
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(http::header::CONTENT_TYPE, HTML_CTYPE)
                 .body(Body::empty())?);
         }
     };
@@ -579,22 +622,45 @@ async fn show_signin(
         .and_then(|token| token.claims.user);
 
     if let Some(user) = authenticated_user {
-        if let Some(_hosts) = app_state.policy.authorize(&user) {
-            return Ok(Response::builder()
-                .status(StatusCode::FOUND)
-                .header(
-                    http::header::LOCATION,
-                    signin_query
-                        .redirect
-                        .expect("should have redirect query string at this point"),
-                )
-                .body(Body::empty())?);
+        if let Some(hosts) = app_state.policy.authorize(&user) {
+            let redirect_host = redirect_uri.host().unwrap_or("");
+            if is_valid_redirect_uri(redirect_host, hosts) {
+                return Ok(Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header(http::header::LOCATION, &redirect_url)
+                    .body(Body::empty())?);
+            }
         }
+
+        return Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(http::header::CONTENT_TYPE, HTML_CTYPE)
+            .body(Body::empty())?);
     }
 
+    if jar
+        .get(DEFAULT_PREAUTH_COOKIE_NAME)
+        .and_then(|cookie| validate_token(cookie.value(), &app_state.decoding_key))
+        .and_then(|token| token.claims.csrf_token)
+        .is_some()
+    {
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, HTML_CTYPE)
+            .body(Body::from(app_state.static_pages.login.clone()))?);
+    }
+
+    let mut rng = rand::rngs::OsRng;
+    let mut csrf_token_bytes = [0u8; 16];
+    rng.try_fill_bytes(&mut csrf_token_bytes)
+        .expect("get random bytes");
+    let csrf_token = hex::encode(&csrf_token_bytes);
+
+    // can't verify the redirect_url here, first we need to know who is this user
     let claims = Claims::new(
         None,
-        Some(redirect.to_string()),
+        Some(redirect_url),
+        Some(csrf_token.clone()),
         app_state.session.expiration_secs,
     );
     let token = jwt::encode(
@@ -609,12 +675,7 @@ async fn show_signin(
         .same_site(cookie::SameSite::Strict)
         .build();
 
-    let mut rng = rand::rngs::OsRng;
-    let mut csrf_token = [0u8; 16];
-    rng.try_fill_bytes(&mut csrf_token)
-        .expect("get random bytes");
-
-    let csrf_cookie = cookie::Cookie::build((CSRF_TOKEN_COOKIE_NAME, hex::encode(&csrf_token)))
+    let csrf_cookie = cookie::Cookie::build((CSRF_TOKEN_COOKIE_NAME, &csrf_token))
         .secure(!app_state.session.insecure_http)
         .http_only(false)
         .same_site(cookie::SameSite::Strict)
