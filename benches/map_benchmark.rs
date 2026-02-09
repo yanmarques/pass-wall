@@ -1,7 +1,7 @@
 use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use axum::{body::Body, http::Request};
 use cookie::Cookie;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use pass_wall::{AccessControlConfig, Config, Policy, User};
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use tokio::runtime::Runtime;
@@ -60,26 +60,51 @@ async fn bench_app_signin(config: &Config, user: &str, password: &str) {
         .await
         .expect("failed to send first request");
 
-    let auth_cookie = response
-        .headers()
-        .get("set-cookie")
-        .and_then(|header| header.to_str().ok())
-        .and_then(|set_cookie| Cookie::parse_encoded(set_cookie).ok())
-        .expect("set-cookie response");
+    let mut auth_cookie: Option<Cookie> = None;
+    let mut csrf_cookie: Option<Cookie> = None;
+
+    for header in response.headers() {
+        if header.0 == "set-cookie" {
+            let header_value = header.1.to_str().expect("parse set-cookie");
+            let set_cookie = Cookie::parse_encoded(header_value).expect("parse cookie");
+            if set_cookie.name() == config.server.session.cookie_name {
+                auth_cookie = Some(set_cookie);
+            } else if set_cookie.name() == pass_wall::CSRF_TOKEN_COOKIE_NAME {
+                csrf_cookie = Some(set_cookie);
+            } else {
+                panic!("unknown set-cookie");
+            }
+        }
+    }
+
+    let cookie = format!(
+        "{}={}; {}={}",
+        config.server.session.cookie_name,
+        auth_cookie.expect("auth cookie missing").value(),
+        pass_wall::CSRF_TOKEN_COOKIE_NAME,
+        csrf_cookie.as_ref().expect("crf cookie missing").value()
+    );
 
     let app = pass_wall::app(config).expect("get app router");
-    black_box(
-        app.oneshot(
+    let response = app
+        .oneshot(
             Request::builder()
-                .header("cookie", auth_cookie.to_string())
+                .header("cookie", cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
                 .uri("/signin")
                 .method("POST")
-                .body(Body::new(format!("user={}&password={}", user, password)))
+                .body(Body::new(format!(
+                    "name={}&password={}&csrf_token={}",
+                    user,
+                    password,
+                    csrf_cookie.expect("csrf cookie missing").value()
+                )))
                 .unwrap(),
         )
         .await
-        .expect("failed to send first request"),
-    );
+        .expect("failed to send first request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
@@ -99,28 +124,27 @@ fn criterion_benchmark(c: &mut Criterion) {
     let rt = Runtime::new().expect("span new runtime");
 
     let mut group = c.benchmark_group("app::flow");
-    group.bench_function("length-100", |b| {
-        b.iter_batched(
-            || {
-                let acls = generate_acls(&user, 100).expect("generate policy test");
-                let mut config = Config::default();
-                config.users = vec![user.clone()];
-                config.acl = acls;
-                return config;
-            },
-            |config| {
+
+    for i in 0..5 {
+        let amount = 100 + (100 * i);
+        group.bench_function(format!("length-{}", amount), |b| {
+            let acls = generate_acls(&user, amount).expect("generate policy test");
+            let mut config = Config::default();
+            config.users = vec![user.clone()];
+            config.acl = acls;
+
+            b.iter(|| {
                 rt.block_on(async {
                     bench_app_signin(
-                        black_box(&config),
-                        black_box(&user.name),
-                        black_box(DEFAULT_PASSWORD),
+                        std::hint::black_box(&config),
+                        std::hint::black_box(&user.name),
+                        std::hint::black_box(DEFAULT_PASSWORD),
                     )
                     .await;
                 });
-            },
-            criterion::BatchSize::LargeInput,
-        );
-    });
+            });
+        });
+    }
     group.finish();
 }
 
