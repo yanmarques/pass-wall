@@ -5,36 +5,36 @@ edition = "2024"
 
 [lib]
 path = "src/lib.rs"
+name = "passwall"
 
 [dependencies]
 anyhow = "1.0.97"
 argon2 = "0.5.3"
-axum = { version = "0.8.4", default-features = false, features = ["form", "http1", "http2", "matched-path", "multipart", "original-uri", "tokio", "tower-log", "tracing", "ws", "query"] }
-axum-extra = { version = "0.10.1", default-features = false, features = ["cookie", "typed-header"] }
-bytes = { version = "1.10.1", default-features = false }
-clap = { version = "=4.5.41", features = ["derive"] }
+axum = { version = "0.8.4", default-features = false, features = ["form", "http1", "http2", "matched-path", "original-uri", "tokio", "tracing", "query"] }
+axum-extra = { version = "0.12.0", default-features = false, features = ["cookie", "typed-header"] }
+bytes = { version = "1.11.1", default-features = false }
+clap = { version = "4.5.57", features = ["derive"] }
 cookie = { version = "0.18.1", default-features = false, features = ["percent-encode"] }
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
-hyper = { version = "1.6.0", default-features = false }
-jsonwebtoken = { version = "9.3.1", default-features = false }
-rand = { version = "0.9.0", default-features = false, features = ["os_rng"] }
+jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }
+rand = { version = "0.9.1", default-features = false, features = ["os_rng"] }
 rpassword = "7.4.0"
 rustc-hash = "2.1.1"
-serde = { version = "1.0.219", default-features = false }
+serde = { version = "1.0.228", default-features = false }
 serde_yaml_ng = "0.10.0"
 subtle = "2.6.1"
-tokio = { version = "1.44.1", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread", "time", "signal"] }
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tokio = { version = "1.49.0", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread", "time", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [dev-dependencies]
-criterion = "0.5.1"
-rand = "0.9.0"
-reqwest = { version = "0.12.23", features = ["cookies"] }
+criterion = "0.8.2"
+rand = "0.9.1"
+reqwest = { version = "0.13.2", features = ["cookies"] }
 tempfile = "3.23.0"
 testcontainers = "0.25.0"
-tokio = { version = "1.44.1", default-features = false, features = ["test-util", "process"] }
-tower = "0.5.2"
+tokio = { version = "1.49.0", default-features = false, features = ["test-util", "process"] }
+tower = "0.5.3"
 
 [[bench]]
 name = "map_benchmark"

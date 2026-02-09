@@ -3,6 +3,12 @@ set -o errexit
 
 CLUSTER=pass-wall
 
+cat <<EOF > /etc/containers/registries.conf.d/000-kind-local-registry.conf
+[[registry]]
+location = "localhost:5001"
+insecure = true
+EOF
+
 # 1. Create registry container unless it already exists
 reg_name='kind-registry'
 reg_port='5001'

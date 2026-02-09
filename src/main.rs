@@ -3,10 +3,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use passwall::Config;
+
 use anyhow::Context;
 use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use clap::{Parser, Subcommand};
-use pass_wall::Config;
 use rand::{TryRngCore, rngs::OsRng};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -80,7 +81,9 @@ async fn main() -> Result<(), anyhow::Error> {
             };
 
             let mut salt = vec![0; argon2::RECOMMENDED_SALT_LEN];
-            OsRng.try_fill_bytes(&mut salt)?;
+            OsRng
+                .try_fill_bytes(&mut salt)
+                .map_err(|err| anyhow::anyhow!("failed to generate random bytes: {:?}", err))?;
             let salt_string = SaltString::encode_b64(&salt).map_err(|err| {
                 tracing::error!(?err);
                 return anyhow::anyhow!("failed to generate salt string");
@@ -113,7 +116,7 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         ))?;
     tracing::info!("starting listener");
 
-    let app = pass_wall::app(&app_config)?;
+    let app = passwall::app(&app_config)?;
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
