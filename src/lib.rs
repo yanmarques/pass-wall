@@ -24,6 +24,7 @@ pub const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$EIEQWL9mT6
 // Internals
 pub const CSRF_TOKEN_COOKIE_NAME: &str = "passwall_csrf_token";
 pub const HTML_CTYPE: &str = "text/html; charset=utf-8";
+pub const X_ORIGINAL_URL: &str = "x-original-url";
 
 // Config
 pub const DEFAULT_KEYSIZE: usize = 32;
@@ -65,16 +66,20 @@ impl<'a> Debug for User {
 #[derive(Clone, Debug)]
 pub struct Policy {
     pub users: rustc_hash::FxHashMap<String, User>,
-    pub authorized_hosts: rustc_hash::FxHashMap<String, Vec<AccessControlConfig>>,
+    pub authorized_hosts:
+        rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<String, AccessControlConfig>>,
 }
 
 impl Policy {
-    /// Returns a list of authorized hosts if the given user is authorized to
-    /// access the given host, according to the defined policy.
+    /// Returns the ACL configuration for the given host, if the policy allows the user to access
+    /// the host.
     ///
     /// Returns [`None`] otherwise.
-    pub fn authorize(&self, user: &String) -> Option<&Vec<AccessControlConfig>> {
-        return self.authorized_hosts.get(user);
+    pub fn authorize(&self, user: &str, host: &str) -> Option<&AccessControlConfig> {
+        return self
+            .authorized_hosts
+            .get(user)
+            .and_then(|hosts| hosts.get(host));
     }
 }
 
@@ -84,8 +89,7 @@ pub struct AccessControlConfig {
     /// The host. It can be a subdomain or a base domain, and it may include a port.
     /// It should not include schemes (e.g.: https:// or http://).
     pub domain: String,
-    /// All users authorized to access the host. If `include_subdomain` is true, also authorize
-    /// users to access all subdomain's of the host's domain (only if a subdomain).
+    /// All users authorized to access the host.
     pub allowed_users: Vec<String>,
     /// Override session options.
     pub cookie: HostCookieConfig,
@@ -116,6 +120,7 @@ pub struct HostCookieConfig {
     /// Controls the 'SameSite' cookie attribute. Choices are 'strict', 'lax', or 'none'. Default
     /// is 'strict'.
     pub same_site: SimpleSameSite,
+    pub domain: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,8 +178,10 @@ pub struct Config {
 #[derive(Clone)]
 pub struct StaticPages {
     pub login: Bytes,
-    pub unauthenticated: Bytes,
+    /// Consistent with HTTP status 401, even though I'd prefer to call it "unauthenticated"
     pub unauthorized: Bytes,
+    /// Consistent with HTTP status 403
+    pub forbidden: Bytes,
 }
 
 /// Some shared data
@@ -270,7 +277,7 @@ impl Claims {
         self.redirect.as_ref().and_then(|redirect| {
             self.csrf_token
                 .as_ref()
-                .and_then(|csrf_token| Some((redirect, csrf_token)))
+                .map(|csrf_token| (redirect, csrf_token))
         })
     }
 }
@@ -307,18 +314,31 @@ impl TryFrom<Config> for Policy {
             );
         }
 
-        let mut authorized_hosts =
-            rustc_hash::FxHashMap::<String, Vec<AccessControlConfig>>::default();
+        let mut authorized_hosts = rustc_hash::FxHashMap::<
+            String,
+            rustc_hash::FxHashMap<String, AccessControlConfig>,
+        >::default();
 
         for access_control in &value.acl {
             if access_control.domain.is_empty() {
-                return Err(anyhow::anyhow!("ACL configuration contains an empty host",));
+                return Err(anyhow::anyhow!("ACL configuration contains an empty host"));
+            }
+
+            if let Some(domain) = &access_control.cookie.domain {
+                if !access_control.domain.ends_with(domain) {
+                    return Err(anyhow::anyhow!(
+                        "Specified domain '{}' must be a subdomain of '{}'. ",
+                        access_control.domain,
+                        domain
+                    ));
+                }
             }
 
             for user_name in &access_control.allowed_users {
                 if user_name.is_empty() {
                     return Err(anyhow::anyhow!(
-                        "ACL configuration contains an empty allowed username",
+                        "The domain '{}' configuration contains an empty allowed username",
+                        access_control.domain,
                     ));
                 }
 
@@ -326,7 +346,7 @@ impl TryFrom<Config> for Policy {
                     Some(u) => u,
                     None => {
                         return Err(anyhow::anyhow!(
-                            "The endpoint '{}' configuration specifies an inexistent user called '{}'",
+                            "The domain '{}' configuration specifies an inexistent user called '{}'",
                             access_control.domain,
                             user_name
                         ));
@@ -334,10 +354,15 @@ impl TryFrom<Config> for Policy {
                 };
 
                 if let Some(hosts) = authorized_hosts.get_mut(&user.name) {
-                    hosts.push(access_control.clone());
+                    hosts.insert(access_control.domain.clone(), access_control.clone());
                 } else {
-                    authorized_hosts
-                        .insert(user.name.clone(), Vec::from_iter([access_control.clone()]));
+                    authorized_hosts.insert(
+                        user.name.clone(),
+                        rustc_hash::FxHashMap::from_iter([(
+                            access_control.domain.clone(),
+                            access_control.clone(),
+                        )]),
+                    );
                 }
             }
         }
@@ -352,8 +377,8 @@ impl TryFrom<Config> for Policy {
 pub fn app(config: &Config) -> anyhow::Result<Router> {
     let static_pages = StaticPages {
         login: Bytes::from_owner(include_bytes!("./../static/login.html")),
-        unauthenticated: Bytes::from_owner(include_bytes!("./../static/unauthenticated.html")),
         unauthorized: Bytes::from_owner(include_bytes!("./../static/unauthorized.html")),
+        forbidden: Bytes::from_owner(include_bytes!("./../static/forbidden.html")),
     };
 
     let policy = Policy::try_from(config.clone())?;
@@ -403,17 +428,6 @@ fn validate_token(token: &str, key: &jwt::DecodingKey) -> Option<jwt::TokenData<
             return None;
         }
     }
-}
-
-// TODO: a base validation is required. do we need more?
-fn is_valid_redirect_uri(redirect_host: &str, acl: &[AccessControlConfig]) -> bool {
-    for acl_config in acl {
-        if redirect_host.ends_with(&acl_config.domain) {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 async fn show_health() -> Result<Response, AppError> {
@@ -505,7 +519,7 @@ async fn signin(
             return Ok(Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
                 .header(http::header::CONTENT_TYPE, HTML_CTYPE)
-                .body(Body::from(app_state.static_pages.unauthenticated.clone()))?);
+                .body(Body::from(app_state.static_pages.unauthorized.clone()))?);
         }
 
         let redirect_uri = match Uri::try_from(redirect_url) {
@@ -524,16 +538,8 @@ async fn signin(
             }
         };
 
-        if let Some(hosts) = app_state.policy.authorize(&user.name) {
-            let redirect_host = redirect_uri.host().unwrap_or("");
-            if !is_valid_redirect_uri(redirect_host, hosts) {
-                tracing::warn!(?redirect_url, "redirect url is invalid, not proceeding");
-                return Ok(Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .header(http::header::CONTENT_TYPE, HTML_CTYPE)
-                    .body(Body::empty())?);
-            }
-
+        let redirect_host = redirect_uri.host().unwrap_or("");
+        if let Some(acl_config) = app_state.policy.authorize(&user.name, redirect_host) {
             let claims = Claims::new(
                 Some(user.name.clone()),
                 None,
@@ -547,30 +553,30 @@ async fn signin(
                 &app_state.encoding_key,
             )?;
 
-            let mut response_builder = Response::builder()
-                .status(StatusCode::FOUND)
-                .header(http::header::LOCATION, redirect_url);
+            let mut set_cookie = cookie::Cookie::build((&app_state.session.cookie_name, &token))
+                .secure(!app_state.session.insecure_http)
+                .http_only(!app_state.session.disable_secure_http_only)
+                .path("/")
+                .same_site(acl_config.cookie.same_site.to_cookie_samesite());
 
-            for acl_config in hosts {
-                let set_cookie = cookie::Cookie::build((&app_state.session.cookie_name, &token))
-                    .secure(!app_state.session.insecure_http)
-                    .http_only(!app_state.session.disable_secure_http_only)
-                    .domain(&acl_config.domain)
-                    .path("/")
-                    .same_site(acl_config.cookie.same_site.to_cookie_samesite());
-
-                response_builder =
-                    response_builder.header(http::header::SET_COOKIE, set_cookie.to_string());
+            if let Some(domain) = &acl_config.cookie.domain {
+                set_cookie = set_cookie.domain(domain);
             }
 
-            return Ok(response_builder.body(Body::empty())?);
+            let response = Response::builder()
+                .status(StatusCode::FOUND)
+                .header(http::header::LOCATION, redirect_url)
+                .header(http::header::SET_COOKIE, set_cookie.to_string())
+                .body(Body::empty())?;
+
+            return Ok(response);
         }
 
         tracing::warn!(user = user.name, "unauthorized user");
         return Ok(Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
+            .status(StatusCode::FORBIDDEN)
             .header(http::header::CONTENT_TYPE, HTML_CTYPE)
-            .body(Body::from(app_state.static_pages.unauthorized))?);
+            .body(Body::from(app_state.static_pages.forbidden))?);
     }
 
     // resist user enumeration through timing attacks
@@ -587,7 +593,7 @@ async fn signin(
     return Ok(Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         .header(http::header::CONTENT_TYPE, HTML_CTYPE)
-        .body(Body::from(app_state.static_pages.unauthenticated.clone()))?);
+        .body(Body::from(app_state.static_pages.unauthorized.clone()))?);
 }
 
 async fn show_signin(
@@ -622,20 +628,18 @@ async fn show_signin(
         .and_then(|token| token.claims.user);
 
     if let Some(user) = authenticated_user {
-        if let Some(hosts) = app_state.policy.authorize(&user) {
-            let redirect_host = redirect_uri.host().unwrap_or("");
-            if is_valid_redirect_uri(redirect_host, hosts) {
-                return Ok(Response::builder()
-                    .status(StatusCode::FOUND)
-                    .header(http::header::LOCATION, &redirect_url)
-                    .body(Body::empty())?);
-            }
+        let redirect_host = redirect_uri.host().unwrap_or("");
+        if let Some(_acl_config) = app_state.policy.authorize(&user, redirect_host) {
+            return Ok(Response::builder()
+                .status(StatusCode::FOUND)
+                .header(http::header::LOCATION, &redirect_url)
+                .body(Body::empty())?);
         }
 
         return Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)
             .header(http::header::CONTENT_TYPE, HTML_CTYPE)
-            .body(Body::empty())?);
+            .body(Body::from(app_state.static_pages.forbidden.clone()))?);
     }
 
     if jar
@@ -694,10 +698,21 @@ async fn proxy_authenticate(
     headers: HeaderMap,
     jar: CookieJar,
 ) -> Result<Response, AppError> {
-    let header_host = headers
-        .get(http::header::HOST)
+    let original_url = headers
+        .get(X_ORIGINAL_URL)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("unknown");
+
+    let redirect_uri = match Uri::try_from(original_url) {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(?err, ?original_url, "failed to parse url");
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(http::header::CONTENT_TYPE, HTML_CTYPE)
+                .body(Body::empty())?);
+        }
+    };
 
     let authorized_hosts = jar
         .get(&app_state.session.cookie_name)
@@ -705,8 +720,9 @@ async fn proxy_authenticate(
         .and_then(|token| token.claims.user)
         .and_then(|user| app_state.policy.users.get(&user))
         .and_then(|authenticated_user| {
-            tracing::debug!(user = authenticated_user.name, header_host, "authenticated");
-            app_state.policy.authorize(&authenticated_user.name)
+            let host = redirect_uri.host().unwrap_or("unknown");
+            tracing::debug!(user = authenticated_user.name, host, "authenticated");
+            app_state.policy.authorize(&authenticated_user.name, host)
         });
 
     if authorized_hosts.is_none() {
@@ -721,9 +737,13 @@ async fn proxy_authenticate(
 }
 
 pub fn policy_test(user: &User, acls: &[AccessControlConfig]) -> Policy {
+    let mut hosts = rustc_hash::FxHashMap::<String, AccessControlConfig>::default();
+    for acl in acls {
+        hosts.insert(acl.domain.clone(), acl.clone());
+    }
     let policy = Policy {
         users: rustc_hash::FxHashMap::from_iter([(user.name.clone(), user.clone())]),
-        authorized_hosts: rustc_hash::FxHashMap::from_iter([(user.name.clone(), acls.to_vec())]),
+        authorized_hosts: rustc_hash::FxHashMap::from_iter([(user.name.clone(), hosts)]),
     };
     return policy;
 }
@@ -750,11 +770,14 @@ mod tests {
             }],
         );
 
-        let hosts = policy.authorize(&user.name);
+        let hosts = policy.authorize(&user.name, "example.com");
         assert_ne!(hosts, None);
-        assert_eq!(hosts.unwrap()[0].domain, "example.com");
-        assert_eq!(hosts.unwrap()[0].cookie.same_site, SimpleSameSite::strict);
+        assert_eq!(hosts.unwrap().domain, "example.com");
+        assert_eq!(hosts.unwrap().cookie.same_site, SimpleSameSite::strict);
 
-        assert_eq!(policy.authorize(&"not-admin".to_string()), None);
+        assert_eq!(
+            policy.authorize(&"not-admin".to_string(), "example.com"),
+            None
+        );
     }
 }
