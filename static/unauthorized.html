@@ -4,10 +4,15 @@
 <head>
 	<meta charset="UTF-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>403 Forbidden</title>
+	<title>Login</title>
 	<style>
 		:root {
 			color-scheme: dark;
+		}
+
+		.error-message {
+			color: #ff4d4f;
+			margin-bottom: 1rem;
 		}
 
 		body {
@@ -20,28 +25,43 @@
 			background-color: #121212;
 			color: #e0e0e0;
 			font-family: sans-serif;
-			text-align: center;
 		}
 
-		.error-container {
+		.login-container {
 			padding: 2rem;
 			border-radius: 12px;
 			background: #1e1e1e;
 			box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-			max-width: 600px;
+			max-width: 320px;
 			width: 100%;
 		}
 
-		h1 {
-			color: #ff4d4f;
+		h2 {
+			text-align: center;
 			margin-bottom: 1.5rem;
 		}
 
-		p {
-			margin-bottom: 1rem;
+		label {
+			display: block;
+			margin-bottom: 0.5rem;
 		}
 
-		a {
+		input {
+			width: 100%;
+			padding: 0.75rem;
+			margin-bottom: 1rem;
+			border: none;
+			border-radius: 8px;
+			background: #2c2c2c;
+			color: #fff;
+			box-sizing: border-box;
+		}
+
+		input:focus {
+			outline: 2px solid #4a90e2;
+		}
+
+		button {
 			display: block;
 			width: 100%;
 			padding: 0.75rem;
@@ -53,19 +73,47 @@
 			box-sizing: border-box;
 		}
 
-		a:hover {
+		button:hover {
 			background: #357abd;
 		}
 	</style>
 </head>
 
 <body>
-	<div class="error-container">
-		<h1>403 Forbidden</h1>
-		<p>The domain you're trying to access is not authorized for your user.</p>
-		<p><b>Please, find help with the system administrator.</b></p>
-		<a href="">Return to sign in</a>
+	<div class="error-message">Invalid credentials</div>
+
+	<div class="login-container">
+		<h2>Login</h2>
+		<form action="signin" method="POST">
+			<label for="name">Username</label>
+			<input autofocus type="text" id="name" name="name" required>
+
+			<label for="password">Password</label>
+			<input type="password" id="password" name="password" required>
+			<input type="hidden" id="csrf_token" name="csrf_token" value="">
+
+			<button type="submit">Login</button>
+		</form>
 	</div>
+	<script type="text/javascript">
+		function getCookie(name) {
+			const cookies = document.cookie.split(';').map(c => c.trim());
+			for (const kv of cookies) {
+				if (!kv) continue;
+				const [k, ...v] = kv.split('=');
+				if (k === name) return decodeURIComponent(v.join('='));
+			}
+			return null;
+		}
+
+		window.addEventListener("load", (event) => {
+			const csrfToken = getCookie("passwall_csrf_token");
+			if (csrfToken !== null) {
+				const input = document.querySelector("#csrf_token");
+				input.setAttribute("value", csrfToken);
+			}
+		});
+	</script>
 </body>
 
 </html>
