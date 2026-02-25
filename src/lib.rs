@@ -25,6 +25,7 @@ pub const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$EIEQWL9mT6
 pub const CSRF_TOKEN_COOKIE_NAME: &str = "passwall_csrf_token";
 pub const HTML_CTYPE: &str = "text/html; charset=utf-8";
 pub const X_ORIGINAL_URL: &str = "x-original-url";
+pub const DEFAULT_DOMAIN_PORT: u16 = 443;
 
 // Config
 pub const DEFAULT_KEYSIZE: usize = 32;
@@ -36,6 +37,9 @@ pub const DEFAULT_PORT: u16 = 9000;
 pub const MAX_PASSWORD_LENGTH: usize = 256;
 pub const MAX_USER_LENGTH: usize = 256;
 pub const MAX_CSRF_TOKEN_LENGTH: usize = 32;
+
+type PolicyAuthHosts =
+    rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<(String, u16), DomainAcl>>;
 
 /// JWT claims
 #[derive(Debug, Serialize, Deserialize)]
@@ -62,37 +66,81 @@ impl<'a> Debug for User {
     }
 }
 
-/// Define who and what can be access and be accessed.
+/// Define who and what can access and be accessed.
 #[derive(Clone, Debug)]
 pub struct Policy {
     pub users: rustc_hash::FxHashMap<String, User>,
-    pub authorized_hosts:
-        rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<String, AccessControlConfig>>,
+    pub authorized_hosts: PolicyAuthHosts,
 }
 
 impl Policy {
+    /// Returns the first ACL configuration for the user.
+    ///
+    /// Returns [`None`] otherwise.
+    pub fn homepage(&self, user: &str) -> Option<&DomainAcl> {
+        return self
+            .authorized_hosts
+            .get(user)
+            .and_then(|hosts| hosts.iter().next())
+            .and_then(|(_, acl)| Some(acl));
+    }
+
     /// Returns the ACL configuration for the given host, if the policy allows the user to access
     /// the host.
     ///
     /// Returns [`None`] otherwise.
-    pub fn authorize(&self, user: &str, host: &str) -> Option<&AccessControlConfig> {
+    pub fn authorize(&self, user: &str, host: &str, port: u16) -> Option<&DomainAcl> {
+        // TODO: avoid allocations in [`host.to_string()`]
         return self
             .authorized_hosts
             .get(user)
-            .and_then(|hosts| hosts.get(host));
+            .and_then(|hosts| hosts.get(&(host.to_string(), port)));
     }
 }
 
 /// User configuration to define who can access what hosts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AccessControlConfig {
-    /// The host. It can be a subdomain or a base domain, and it may include a port.
+pub struct DomainAclConfig {
+    /// The host. It can be a subdomain or a base domain.
     /// It should not include schemes (e.g.: https:// or http://).
     pub domain: String,
+    pub port: u16,
     /// All users authorized to access the host.
     pub allowed_users: Vec<String>,
     /// Override session options.
     pub cookie: HostCookieConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DomainAcl {
+    pub uri: String,
+    pub cookie: HostCookieConfig,
+    pub domain: String,
+    pub port: u16,
+}
+
+impl DomainAcl {
+    pub fn new(
+        domain_config: DomainAclConfig,
+        server_config: &ServerConfig,
+    ) -> anyhow::Result<Self> {
+        let uri = Uri::builder()
+            .scheme(if server_config.scheme_https {
+                "https"
+            } else {
+                "http"
+            })
+            .authority(format!("{}:{}", domain_config.domain, domain_config.port))
+            .path_and_query("/")
+            .build()?;
+
+        Ok(Self {
+            uri: uri.to_string(),
+            domain: domain_config.domain,
+            port: domain_config.port,
+            cookie: domain_config.cookie,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,11 +177,6 @@ pub struct SessionConfig {
     pub cookie_name: String,
     /// Define the maximum lifetime of the session tokens in seconds. Default is 1 hour.
     pub expiration_secs: u64,
-    /// Controls the 'Secure' cookie attribute. When true, allows the cookie to be sent by browers over unencrypted http requests. Default is false.
-    pub insecure_http: bool,
-    /// Controls the 'HttpOnly' cookie attribute. When true, allows JavaScript code in the page to
-    /// access the cookie through `document.cookie`. Default is false.
-    pub disable_secure_http_only: bool,
 }
 
 impl SessionConfig {
@@ -141,8 +184,6 @@ impl SessionConfig {
         Self {
             cookie_name: String::from(DEFAULT_SESSION_COOKIE_NAME),
             expiration_secs: 60 * 60,
-            insecure_http: false,
-            disable_secure_http_only: false,
         }
     }
 }
@@ -155,13 +196,37 @@ pub struct ServerConfig {
     /// Use the default generated config unless you know what you are doing.
     /// The default key generates 256 bits of entropy for the HMAC-SHA256 algorithm used in JWTs.
     pub key: String,
+    /// Whether the reverse proxy uses HTTPS.
+    pub scheme_https: bool,
     /// Session configuration.
     pub session: SessionConfig,
-    /// The URL to redirect the authentication server can not figure out the URL the user aims to
-    /// arrive. This usually happens when the user manually type the authentication URL, in which
-    /// case, the server needs information of where to fall back.
+    /// The URL to redirect the authentication server can not figure out the URL the anonymous user
+    /// aims to arrive. This usually happens when the user manually type the authentication URL,
+    /// in which case, the server needs information of where to fall back.
     pub fallback_url: String,
     pub url_prefix: Option<String>,
+}
+
+impl ServerConfig {
+    pub fn url_prefix(&self) -> &str {
+        if let Some(url) = self.url_prefix.as_ref() {
+            return url;
+        }
+
+        return "/";
+    }
+
+    /// Controls the 'HttpOnly' cookie attribute. When true, allows JavaScript code in the page to
+    /// access the cookie through `document.cookie`. Default is false.
+    pub fn http_only_cookie(&self) -> bool {
+        return self.scheme_https;
+    }
+
+    /// Controls the 'Secure' cookie attribute. When true, allows the cookie to be sent by browers
+    /// over unencrypted http requests. Default is false.
+    pub fn secure_cookie(&self) -> bool {
+        return self.scheme_https;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,7 +236,7 @@ pub struct Config {
     /// Allowed users.
     pub users: Vec<User>,
     /// Access control per host and user.
-    pub acl: Vec<AccessControlConfig>,
+    pub acl: Vec<DomainAclConfig>,
 }
 
 /// HTML application pages.
@@ -193,8 +258,7 @@ pub struct AppState {
     pub decoding_key: jwt::DecodingKey,
     pub static_pages: StaticPages,
     pub policy: Policy,
-    pub session: SessionConfig,
-    pub fallback_url: String,
+    pub server_cfg: ServerConfig,
     /// During sign in, it performs password verification regardless of whether
     /// the given user exists or not. This is the hash used for the verification.
     pub dummy_passwd_hash: argon2::PasswordHash<'static>,
@@ -244,6 +308,7 @@ impl Config {
                 bind: format!("0.0.0.0:{DEFAULT_PORT}"),
                 key: key,
                 session: SessionConfig::default(),
+                scheme_https: true,
                 fallback_url: String::new(),
                 url_prefix: None,
             },
@@ -314,10 +379,7 @@ impl TryFrom<Config> for Policy {
             );
         }
 
-        let mut authorized_hosts = rustc_hash::FxHashMap::<
-            String,
-            rustc_hash::FxHashMap<String, AccessControlConfig>,
-        >::default();
+        let mut authorized_hosts = PolicyAuthHosts::default();
 
         for access_control in &value.acl {
             if access_control.domain.is_empty() {
@@ -354,13 +416,16 @@ impl TryFrom<Config> for Policy {
                 };
 
                 if let Some(hosts) = authorized_hosts.get_mut(&user.name) {
-                    hosts.insert(access_control.domain.clone(), access_control.clone());
+                    hosts.insert(
+                        (access_control.domain.clone(), access_control.port),
+                        DomainAcl::new(access_control.clone(), &value.server)?,
+                    );
                 } else {
                     authorized_hosts.insert(
                         user.name.clone(),
                         rustc_hash::FxHashMap::from_iter([(
-                            access_control.domain.clone(),
-                            access_control.clone(),
+                            (access_control.domain.clone(), access_control.port),
+                            DomainAcl::new(access_control.clone(), &value.server)?,
                         )]),
                     );
                 }
@@ -391,6 +456,8 @@ pub fn app(config: &Config) -> anyhow::Result<Router> {
 
     let mut app = Router::new()
         .route("/", axum::routing::get(show_signin))
+        .route("/homepage", axum::routing::get(homepage))
+        .route("/signout", axum::routing::post(signout))
         .route("/signin", axum::routing::post(signin))
         .route("/authenticate", axum::routing::get(proxy_authenticate))
         .route("/healthz", axum::routing::get(show_health))
@@ -398,10 +465,9 @@ pub fn app(config: &Config) -> anyhow::Result<Router> {
         .with_state(AppState {
             policy,
             static_pages,
+            server_cfg: config.server.clone(),
             encoding_key: jwt::EncodingKey::from_secret(&app_key_bytes),
             decoding_key: jwt::DecodingKey::from_secret(&app_key_bytes),
-            session: config.server.session.clone(),
-            fallback_url: config.server.fallback_url.clone(),
             dummy_passwd_hash,
         });
 
@@ -436,6 +502,123 @@ async fn show_health() -> Result<Response, AppError> {
         .body(Body::empty())?);
 }
 
+async fn homepage(State(app_state): State<AppState>, jar: CookieJar) -> Result<Response, AppError> {
+    let jwt_claims = match jar
+        .get(&app_state.server_cfg.session.cookie_name)
+        .as_ref()
+        .and_then(|cookie| validate_token(cookie.value(), &app_state.decoding_key))
+        .and_then(|token| Some(token.claims))
+    {
+        Some(j) => j,
+        None => {
+            return Ok(Response::builder()
+                .status(StatusCode::FOUND)
+                .header(http::header::LOCATION, app_state.server_cfg.fallback_url)
+                .body(Body::empty())?);
+        }
+    };
+
+    let url = jwt_claims
+        .user
+        .and_then(|user| app_state.policy.homepage(&user))
+        .and_then(|acl| Some(&acl.uri))
+        .unwrap_or(&app_state.server_cfg.fallback_url);
+
+    return Ok(Response::builder()
+        .status(StatusCode::FOUND)
+        .header(http::header::LOCATION, url)
+        .body(Body::empty())?);
+}
+
+async fn signout(
+    State(app_state): State<AppState>,
+    Query(signin_query): Query<SigninQuery>,
+    jar: CookieJar,
+) -> Result<Response, AppError> {
+    let cookie = match jar.get(&app_state.server_cfg.session.cookie_name) {
+        Some(c) => c,
+        None => {
+            let location = if let Some(redirect_url) = signin_query.redirect {
+                // TODO: urlencode
+                &format!(
+                    "{}?redirect={}",
+                    &app_state.server_cfg.url_prefix(),
+                    redirect_url
+                )
+            } else {
+                app_state.server_cfg.url_prefix()
+            };
+
+            return Ok(Response::builder()
+                .status(StatusCode::FOUND)
+                .header(http::header::LOCATION, location)
+                .body(Body::empty())?);
+        }
+    };
+
+    let jwt_claims = match validate_token(cookie.value(), &app_state.decoding_key)
+        .and_then(|token| Some(token.claims))
+    {
+        Some(j) => j,
+        None => {
+            let location = if let Some(redirect_url) = signin_query.redirect {
+                // TODO: urlencode
+                &format!(
+                    "{}?redirect={}",
+                    &app_state.server_cfg.url_prefix(),
+                    redirect_url
+                )
+            } else {
+                app_state.server_cfg.url_prefix()
+            };
+
+            return Ok(Response::builder()
+                .status(StatusCode::FOUND)
+                .header(http::header::LOCATION, location)
+                .body(Body::empty())?);
+        }
+    };
+
+    let user = match jwt_claims.user.as_ref() {
+        Some(u) => u,
+        None => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::empty())?);
+        }
+    };
+
+    let redirect_url = signin_query.redirect.as_ref().or_else(|| {
+        jwt_claims.redirect.as_ref().or_else(|| {
+            app_state
+                .policy
+                .homepage(&user)
+                .and_then(|acl| Some(&acl.uri))
+        })
+    });
+
+    let location = if let Some(url) = redirect_url {
+        // TODO: urlencode
+        &format!("{}?redirect={}", &app_state.server_cfg.url_prefix(), url)
+    } else {
+        app_state.server_cfg.url_prefix()
+    };
+
+    let set_cookie = cookie::Cookie::build((&app_state.server_cfg.session.cookie_name, ""))
+        .secure(app_state.server_cfg.secure_cookie())
+        .http_only(app_state.server_cfg.http_only_cookie())
+        .domain(cookie.domain().unwrap_or(""))
+        .path("/");
+
+    let response = Response::builder()
+        .status(StatusCode::FOUND)
+        .header(http::header::LOCATION, location)
+        .header(http::header::SET_COOKIE, set_cookie.to_string())
+        .body(Body::empty())?;
+
+    return Ok(response);
+}
+
 async fn signin(
     State(app_state): State<AppState>,
     jar: CookieJar,
@@ -457,18 +640,31 @@ async fn signin(
             .body(Body::empty())?);
     }
 
-    let jwt_claims = match jar
-        .get(DEFAULT_PREAUTH_COOKIE_NAME)
-        .as_ref()
-        .and_then(|preauth_cookie| validate_token(preauth_cookie.value(), &app_state.decoding_key))
+    let preauth_cookie = match jar.get(DEFAULT_PREAUTH_COOKIE_NAME) {
+        Some(c) => c,
+        None => {
+            return Ok(Response::builder()
+                .status(StatusCode::FOUND)
+                .header(http::header::LOCATION, app_state.server_cfg.fallback_url)
+                .body(Body::empty())?);
+        }
+    };
+
+    let jwt_claims = match validate_token(preauth_cookie.value(), &app_state.decoding_key)
         .and_then(|preauth_token| Some(preauth_token.claims))
     {
         Some(j) => j,
         None => {
-            tracing::warn!("invalid pre-authentication JWT");
+            let set_cookie = cookie::Cookie::build((DEFAULT_PREAUTH_COOKIE_NAME, ""))
+                .secure(app_state.server_cfg.secure_cookie())
+                .http_only(app_state.server_cfg.http_only_cookie())
+                .domain(preauth_cookie.domain().unwrap_or(""))
+                .path("/");
+
             return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header(http::header::CONTENT_TYPE, HTML_CTYPE)
+                .status(StatusCode::FOUND)
+                .header(http::header::LOCATION, app_state.server_cfg.fallback_url)
+                .header(http::header::SET_COOKIE, set_cookie.to_string())
                 .body(Body::empty())?);
         }
     };
@@ -538,13 +734,14 @@ async fn signin(
             }
         };
 
-        let redirect_host = redirect_uri.host().unwrap_or("");
-        if let Some(acl_config) = app_state.policy.authorize(&user.name, redirect_host) {
+        let host = redirect_uri.host().unwrap_or("");
+        let port = redirect_uri.port_u16().unwrap_or(DEFAULT_DOMAIN_PORT);
+        if let Some(acl_config) = app_state.policy.authorize(&user.name, host, port) {
             let claims = Claims::new(
                 Some(user.name.clone()),
                 None,
                 None,
-                app_state.session.expiration_secs,
+                app_state.server_cfg.session.expiration_secs,
             );
 
             let token = jwt::encode(
@@ -553,11 +750,12 @@ async fn signin(
                 &app_state.encoding_key,
             )?;
 
-            let mut set_cookie = cookie::Cookie::build((&app_state.session.cookie_name, &token))
-                .secure(!app_state.session.insecure_http)
-                .http_only(!app_state.session.disable_secure_http_only)
-                .path("/")
-                .same_site(acl_config.cookie.same_site.to_cookie_samesite());
+            let mut set_cookie =
+                cookie::Cookie::build((&app_state.server_cfg.session.cookie_name, &token))
+                    .secure(app_state.server_cfg.secure_cookie())
+                    .http_only(app_state.server_cfg.http_only_cookie())
+                    .path("/")
+                    .same_site(acl_config.cookie.same_site.to_cookie_samesite());
 
             if let Some(domain) = &acl_config.cookie.domain {
                 set_cookie = set_cookie.domain(domain);
@@ -606,7 +804,7 @@ async fn show_signin(
         None => {
             return Ok(Response::builder()
                 .status(StatusCode::FOUND)
-                .header(http::header::LOCATION, &app_state.fallback_url)
+                .header(http::header::LOCATION, &app_state.server_cfg.fallback_url)
                 .body(Body::empty())?);
         }
     };
@@ -623,13 +821,14 @@ async fn show_signin(
     };
 
     let authenticated_user = jar
-        .get(&app_state.session.cookie_name)
+        .get(&app_state.server_cfg.session.cookie_name)
         .and_then(|cookie| validate_token(cookie.value(), &app_state.decoding_key))
         .and_then(|token| token.claims.user);
 
     if let Some(user) = authenticated_user {
-        let redirect_host = redirect_uri.host().unwrap_or("");
-        if let Some(_acl_config) = app_state.policy.authorize(&user, redirect_host) {
+        let host = redirect_uri.host().unwrap_or("");
+        let port = redirect_uri.port_u16().unwrap_or(DEFAULT_DOMAIN_PORT);
+        if let Some(_acl_config) = app_state.policy.authorize(&user, host, port) {
             return Ok(Response::builder()
                 .status(StatusCode::FOUND)
                 .header(http::header::LOCATION, &redirect_url)
@@ -642,12 +841,20 @@ async fn show_signin(
             .body(Body::from(app_state.static_pages.forbidden.clone()))?);
     }
 
-    if jar
+    let preauth_claims = jar
         .get(DEFAULT_PREAUTH_COOKIE_NAME)
         .and_then(|cookie| validate_token(cookie.value(), &app_state.decoding_key))
-        .and_then(|token| token.claims.csrf_token)
-        .is_some()
-    {
+        .and_then(|token| Some(token.claims));
+
+    let has_redirect_changed = preauth_claims.as_ref().and_then(|c| {
+        if c.redirect.as_ref() == Some(&redirect_url) {
+            Some(false)
+        } else {
+            Some(true)
+        }
+    });
+
+    if preauth_claims.is_some() && has_redirect_changed == Some(false) {
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header(http::header::CONTENT_TYPE, HTML_CTYPE)
@@ -660,12 +867,11 @@ async fn show_signin(
         .expect("get random bytes");
     let csrf_token = hex::encode(&csrf_token_bytes);
 
-    // can't verify the redirect_url here, first we need to know who is this user
     let claims = Claims::new(
         None,
         Some(redirect_url),
         Some(csrf_token.clone()),
-        app_state.session.expiration_secs,
+        app_state.server_cfg.session.expiration_secs,
     );
     let token = jwt::encode(
         &jwt::Header::new(jwt::Algorithm::HS256),
@@ -674,13 +880,14 @@ async fn show_signin(
     )?;
 
     let sess_cookie = cookie::Cookie::build((DEFAULT_PREAUTH_COOKIE_NAME, token))
-        .secure(!app_state.session.insecure_http)
-        .http_only(!app_state.session.disable_secure_http_only)
+        .secure(app_state.server_cfg.secure_cookie())
+        .http_only(app_state.server_cfg.http_only_cookie())
         .same_site(cookie::SameSite::Strict)
+        .path("/")
         .build();
 
     let csrf_cookie = cookie::Cookie::build((CSRF_TOKEN_COOKIE_NAME, &csrf_token))
-        .secure(!app_state.session.insecure_http)
+        .secure(app_state.server_cfg.secure_cookie())
         .http_only(false)
         .same_site(cookie::SameSite::Strict)
         .build();
@@ -713,16 +920,18 @@ async fn proxy_authenticate(
                 .body(Body::empty())?);
         }
     };
-
     let authorized_hosts = jar
-        .get(&app_state.session.cookie_name)
+        .get(&app_state.server_cfg.session.cookie_name)
         .and_then(|cookie| validate_token(cookie.value(), &app_state.decoding_key))
         .and_then(|token| token.claims.user)
         .and_then(|user| app_state.policy.users.get(&user))
         .and_then(|authenticated_user| {
-            let host = redirect_uri.host().unwrap_or("unknown");
+            let host = redirect_uri.host().unwrap_or("");
+            let port = redirect_uri.port_u16().unwrap_or(DEFAULT_DOMAIN_PORT);
             tracing::debug!(user = authenticated_user.name, host, "authenticated");
-            app_state.policy.authorize(&authenticated_user.name, host)
+            app_state
+                .policy
+                .authorize(&authenticated_user.name, host, port)
         });
 
     if authorized_hosts.is_none() {
@@ -736,10 +945,13 @@ async fn proxy_authenticate(
         .body(Body::empty())?);
 }
 
-pub fn policy_test(user: &User, acls: &[AccessControlConfig]) -> Policy {
-    let mut hosts = rustc_hash::FxHashMap::<String, AccessControlConfig>::default();
+pub fn policy_test(config: Config, user: &User, acls: &[DomainAclConfig]) -> Policy {
+    let mut hosts = rustc_hash::FxHashMap::<(String, u16), DomainAcl>::default();
     for acl in acls {
-        hosts.insert(acl.domain.clone(), acl.clone());
+        hosts.insert(
+            (acl.domain.clone(), acl.port),
+            DomainAcl::new(acl.clone(), &config.server).expect("create domain acl"),
+        );
     }
     let policy = Policy {
         users: rustc_hash::FxHashMap::from_iter([(user.name.clone(), user.clone())]),
@@ -760,23 +972,26 @@ mod tests {
         };
 
         let policy = policy_test(
+            Config::default(),
             &user,
-            &[AccessControlConfig {
+            &[DomainAclConfig {
                 domain: String::from("example.com"),
+                port: 8443,
                 allowed_users: vec![],
                 cookie: HostCookieConfig {
                     same_site: SimpleSameSite::strict,
+                    domain: None,
                 },
             }],
         );
 
-        let hosts = policy.authorize(&user.name, "example.com");
+        let hosts = policy.authorize(&user.name, "example.com", 8443);
         assert_ne!(hosts, None);
         assert_eq!(hosts.unwrap().domain, "example.com");
         assert_eq!(hosts.unwrap().cookie.same_site, SimpleSameSite::strict);
 
         assert_eq!(
-            policy.authorize(&"not-admin".to_string(), "example.com"),
+            policy.authorize(&"not-admin".to_string(), "example.com", 8443),
             None
         );
     }
