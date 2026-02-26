@@ -1,5 +1,7 @@
 use futures_util::StreamExt;
+use rand::Rng;
 use std::{
+    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     os::unix::fs::PermissionsExt,
     path::Path,
@@ -375,6 +377,16 @@ async fn build_client(config: &Config) -> color_eyre::Result<TestClient> {
         };
     }
 
+    // let mut rng = rand::rng();
+    // let mut bytes = [0u8; 6];
+    // rng.fill(&mut bytes);
+    // let mut buf = Vec::with_capacity(12);
+    // for b in bytes.iter() {
+    //     write!(&mut buf, "{:02x}", b)?;
+    // }
+    //
+    // let random_id = String::from_utf8(buf)?;
+
     let auth_container_port = SocketAddr::from_str(&config.server.bind)?.port();
     let auth_container = GenericImage::new("docker.io/debian", "trixie-slim")
         .with_exposed_port(auth_container_port.tcp())
@@ -384,7 +396,7 @@ async fn build_client(config: &Config) -> color_eyre::Result<TestClient> {
         .with_copy_to("/passwall.yaml", config_path)
         .with_copy_to("/pass-wall", Path::new("./target/debug/pass-wall"))
         .with_ready_conditions(vec![WaitFor::message_on_stdout("starting listener")])
-        .with_container_name("passwall")
+        // .with_container_name(format!("passwall-{}", random_id))
         .with_network(&net_config.name)
         .start()
         .await?;
@@ -404,7 +416,7 @@ async fn build_client(config: &Config) -> color_eyre::Result<TestClient> {
         )
         .with_copy_to("/etc/nginx/nginx.conf", Path::new("./tests/nginx.conf"))
         .with_ready_conditions(vec![WaitFor::message_on_stderr("start worker processes")])
-        .with_container_name("nginx")
+        // .with_container_name(format!("nginx-{}", random_id))
         .with_network(&net_config.name)
         .start()
         .await?;
@@ -418,16 +430,6 @@ async fn build_client(config: &Config) -> color_eyre::Result<TestClient> {
         .redirect(RedirectPolicy::none())
         .build()?;
 
-    // let hub_container = GenericImage::new("docker.io/selenium/hub", "4.41.0")
-    //     .with_exposed_port(4442.into())
-    //     .with_exposed_port(4443.into())
-    //     .with_exposed_port(4444.into())
-    //     .with_container_name("selenium-hub")
-    //     .with_ready_conditions(vec![WaitFor::message_on_stdout("Started Selenium Hub")])
-    //     .with_network(&net_config.name)
-    //     .start()
-    //     .await?;
-    //
     let nginx_ip = get_bridge_ip_address(&cli, &nginx_container, &net_config.name).await?;
     let selenium_container = GenericImage::new("docker.io/selenium/node-chromium", "145.0")
         .with_host(
@@ -451,7 +453,7 @@ async fn build_client(config: &Config) -> color_eyre::Result<TestClient> {
         .with_env_var("SE_EVENT_BUS_SUBSCRIBE_PORT", "4443")
         .with_shm_size(2048 * 1024) // 2G
         .with_ready_conditions([WaitFor::message_on_stdout("Started Selenium node")].into())
-        .with_container_name("chromium")
+        // .with_container_name(format!("chromium-{}", random_id))
         .with_network(&net_config.name)
         .start()
         .await?;
@@ -463,7 +465,6 @@ async fn build_client(config: &Config) -> color_eyre::Result<TestClient> {
 
     // ensure the pod can create files in the videos folder
     // TODO: dynamically query the group id from the selenium/video image
-    std::fs::remove_dir_all(&videos_dir)?;
     std::fs::create_dir_all(&videos_dir)?;
     let mut perms = std::fs::metadata(&videos_dir)?.permissions();
     perms.set_mode(0o770);
@@ -478,9 +479,21 @@ async fn build_client(config: &Config) -> color_eyre::Result<TestClient> {
         .spawn()?
         .wait()?;
 
+    let opts: Option<InspectContainerOptions> = None;
+    let selenium_container_name = cli
+        .inspect_container(selenium_container.id(), opts)
+        .await?
+        .name
+        .ok_or_else(|| {
+            return color_eyre::eyre::eyre!("missing selenium container name");
+        })?;
+
     let video_container = GenericImage::new("docker.io/selenium/video", "ffmpeg-8.0-20260222")
         .with_mount(Mount::bind_mount(videos_dir, "/videos"))
-        .with_env_var("DISPLAY_CONTAINER_NAME", "chromium")
+        .with_env_var(
+            "DISPLAY_CONTAINER_NAME",
+            selenium_container_name.trim_start_matches("/"),
+        )
         .with_env_var("SE_VIDEO_FILE_NAME", "auto")
         .with_ready_conditions([WaitFor::message_on_stdout("Waiting for the display")].into())
         .with_network(&net_config.name)
@@ -530,13 +543,34 @@ async fn wait_for_input_filled(
     }
 }
 
+async fn wait_for_url_match_host(
+    driver: &WebDriver,
+    host: &str,
+    timeout: tokio::time::Duration,
+) -> WebDriverResult<()> {
+    let start = std::time::Instant::now();
+
+    loop {
+        let url = driver.current_url().await?;
+        if url.host_str() == Some(host) {
+            return Ok(());
+        }
+
+        if start.elapsed() > timeout {
+            return Err(WebDriverError::Timeout("url did not match".into()));
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    }
+}
+
 // main test scenarios:
 // 1. single subdomain, cookie is per subdomain
 // 2. multiple subdomains, cookie works for all subdomains of that domain
 // 2. single domain, cookie works only for that domain, not for subdomains
 #[tokio::test(flavor = "multi_thread")]
 async fn test_authorizes_subdomain() -> color_eyre::Result<()> {
-    color_eyre::install()?;
+    let _ = color_eyre::install();
 
     let mut config = Config::default();
     config.users.push(new_user(DEFAULT_USER, DEFAULT_PASSWORD));
@@ -563,6 +597,13 @@ async fn test_authorizes_subdomain() -> color_eyre::Result<()> {
 
     let _ = wait_for_input_filled(&driver, "csrf_token", tokio::time::Duration::from_secs(2)).await;
 
+    wait_for_url_match_host(
+        &driver,
+        "sub-c.example.com",
+        tokio::time::Duration::from_secs(5),
+    )
+    .await?;
+
     let name_form = driver.query(By::Id("name")).first().await?;
     name_form.send_keys(DEFAULT_USER).await?;
 
@@ -578,6 +619,80 @@ async fn test_authorizes_subdomain() -> color_eyre::Result<()> {
     let elem = driver.query(By::Id("page")).first().await?;
     let page = elem.text().await?;
     assert_eq!(page, "sub-c");
+
+    driver.quit().await?;
+    return Ok(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_authorizes_multiple_subdomains_access_all() -> color_eyre::Result<()> {
+    let _ = color_eyre::install();
+
+    let mut config = Config::default();
+    config.users.push(new_user(DEFAULT_USER, DEFAULT_PASSWORD));
+    config.server.scheme_https = false;
+    config.acl.extend([
+        DomainAclConfig {
+            domain: "sub-a.example.com".into(),
+            port: 80,
+            allowed_users: vec![DEFAULT_USER.into()],
+            cookie: HostCookieConfig {
+                same_site: SimpleSameSite::lax,
+                domain: Some("example.com".into()),
+            },
+        },
+        DomainAclConfig {
+            domain: "sub-b.example.com".into(),
+            port: 80,
+            allowed_users: vec![DEFAULT_USER.into()],
+            cookie: HostCookieConfig {
+                same_site: SimpleSameSite::lax,
+                domain: Some("example.com".into()),
+            },
+        },
+    ]);
+
+    let client = build_client(&config).await?;
+    let server_url = client.selenium_url.to_string();
+
+    let mut caps = DesiredCapabilities::chrome();
+    caps.insert_base_capability(
+        "se:name".into(),
+        "test_authorizes_multiple_subdomains_access_all".into(),
+    );
+
+    let driver = WebDriver::new(&server_url, caps).await?;
+    driver.goto("http://sub-a.example.com").await?;
+
+    let _ = wait_for_input_filled(&driver, "csrf_token", tokio::time::Duration::from_secs(2)).await;
+
+    wait_for_url_match_host(
+        &driver,
+        "auth.example.com",
+        tokio::time::Duration::from_secs(5),
+    )
+    .await?;
+
+    let name_form = driver.query(By::Id("name")).first().await?;
+    name_form.send_keys(DEFAULT_USER).await?;
+
+    let password_form = driver.query(By::Id("password")).first().await?;
+    password_form.send_keys(DEFAULT_PASSWORD).await?;
+
+    let elem_button = driver
+        .query(By::Css("button[type='submit']"))
+        .first()
+        .await?;
+    elem_button.click().await?;
+
+    let elem = driver.query(By::Id("page")).first().await?;
+    let page = elem.text().await?;
+    assert_eq!(page, "sub-a");
+
+    driver.goto("http://sub-b.example.com").await?;
+    let elem = driver.query(By::Id("page")).first().await?;
+    let page = elem.text().await?;
+    assert_eq!(page, "sub-b");
 
     driver.quit().await?;
     return Ok(());
