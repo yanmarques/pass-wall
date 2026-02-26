@@ -25,7 +25,6 @@ pub const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$EIEQWL9mT6
 pub const CSRF_TOKEN_COOKIE_NAME: &str = "passwall_csrf_token";
 pub const HTML_CTYPE: &str = "text/html; charset=utf-8";
 pub const X_ORIGINAL_URL: &str = "x-original-url";
-pub const DEFAULT_DOMAIN_PORT: u16 = 443;
 
 // Config
 pub const DEFAULT_KEYSIZE: usize = 32;
@@ -262,6 +261,16 @@ pub struct AppState {
     /// During sign in, it performs password verification regardless of whether
     /// the given user exists or not. This is the hash used for the verification.
     pub dummy_passwd_hash: argon2::PasswordHash<'static>,
+}
+
+impl AppState {
+    pub fn default_port(&self) -> u16 {
+        if self.server_cfg.scheme_https {
+            return 443;
+        }
+
+        return 80;
+    }
 }
 
 /// Login form input
@@ -735,7 +744,7 @@ async fn signin(
         };
 
         let host = redirect_uri.host().unwrap_or("");
-        let port = redirect_uri.port_u16().unwrap_or(DEFAULT_DOMAIN_PORT);
+        let port = redirect_uri.port_u16().unwrap_or(app_state.default_port());
         if let Some(acl_config) = app_state.policy.authorize(&user.name, host, port) {
             let claims = Claims::new(
                 Some(user.name.clone()),
@@ -827,7 +836,7 @@ async fn show_signin(
 
     if let Some(user) = authenticated_user {
         let host = redirect_uri.host().unwrap_or("");
-        let port = redirect_uri.port_u16().unwrap_or(DEFAULT_DOMAIN_PORT);
+        let port = redirect_uri.port_u16().unwrap_or(app_state.default_port());
         if let Some(_acl_config) = app_state.policy.authorize(&user, host, port) {
             return Ok(Response::builder()
                 .status(StatusCode::FOUND)
@@ -890,6 +899,7 @@ async fn show_signin(
         .secure(app_state.server_cfg.secure_cookie())
         .http_only(false)
         .same_site(cookie::SameSite::Strict)
+        .path("/")
         .build();
 
     return Ok(Response::builder()
@@ -927,7 +937,7 @@ async fn proxy_authenticate(
         .and_then(|user| app_state.policy.users.get(&user))
         .and_then(|authenticated_user| {
             let host = redirect_uri.host().unwrap_or("");
-            let port = redirect_uri.port_u16().unwrap_or(DEFAULT_DOMAIN_PORT);
+            let port = redirect_uri.port_u16().unwrap_or(app_state.default_port());
             tracing::debug!(user = authenticated_user.name, host, "authenticated");
             app_state
                 .policy
