@@ -1,14 +1,13 @@
-services:
-  nginx:
-    image: nginx:stable-perl
-    ports:
-      - 8000:8000
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf
-  passwall:
-    build: ../
-    environment:
-      RUST_LOG: pass_wall=debug
-    volumes:
-      - ./../passwall.yaml:/app/passwall.yaml:ro
+networks:
+  grid:
+    name: grid
+    driver: bridge
 
+services:
+  hub:
+    image: docker.io/selenium/hub:4.41.0
+    container_name: hub
+    ports:
+      - "4444:4444"
+    networks:
+    - grid
