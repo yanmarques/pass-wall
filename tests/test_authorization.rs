@@ -1,29 +1,21 @@
 use futures_util::StreamExt;
-use rand::Rng;
 use std::{
-    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     os::unix::fs::PermissionsExt,
     path::Path,
     str::FromStr,
-    sync::{Arc, mpsc},
+    sync::mpsc,
 };
 
 use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
-use axum::http::StatusCode;
 use passwall::{Config, DomainAclConfig, HostCookieConfig, SimpleSameSite, User};
-use reqwest::{
-    Client, RequestBuilder, Url,
-    cookie::{CookieStore, Jar},
-    redirect::Policy as RedirectPolicy,
-};
+use reqwest::Url;
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
     bollard::{
         Docker,
         query_parameters::{
             InspectContainerOptions, InspectNetworkOptions, LogsOptions, LogsOptionsBuilder,
-            WaitContainerOptions,
         },
         secret::NetworkCreateRequest,
     },
@@ -31,172 +23,135 @@ use testcontainers::{
     runners::AsyncRunner,
 };
 use thirtyfour::{
-    By, CapabilitiesHelper, DesiredCapabilities, WebDriver, WebElement,
+    By, DesiredCapabilities, WebDriver, WebElement,
     error::{WebDriverError, WebDriverResult},
     prelude::ElementQueryable,
 };
 
 const DEFAULT_USER: &str = "admin";
 const DEFAULT_PASSWORD: &str = "admin";
-const DEFAULT_HOST: &str = "private.example.com";
-const DEFAULT_DOMAIN: &str = "example.com";
+
+const DEFAULT_PASSWALL_HOSTNAME: &str = "passwall";
+
+// TODO: handle passwall under the same domain name, different path
+const DEFAULT_NGINX_CONF_TEMPLATE: &str = "user root root;
+worker_processes    auto;
+
+error_log   /dev/stderr  info;
+pid /run/nginx.pid;
+
+events {
+    worker_connections  64;
+}
+
+http {
+    default_type  text/html;
+    log_format main '$remote_addr - $remote_user $request';
+    upstream authserver {
+        server {AUTHSERVER_HOST};
+    }
+
+{BODY}
+
+    server {
+        listen        80;
+        server_name   {AUTHSERVER_NAME};
+        access_log   /dev/stdout  main;
+
+        location /favicon.ico {
+	    return 404;
+	}
+
+	location / {
+	    proxy_pass http://authserver{URL_PREFIX};
+	}
+    }
+}";
+const DEFAULT_NGINX_CONF_SERVER_TEMPLATE: &str = "
+    server {
+        listen        80;
+        server_name   {SERVER_NAME};
+        access_log   /dev/stdout  main;
+        location /favicon.ico {
+	    return 404;
+	}
+
+        location / {
+	    auth_request /authenticate;
+	    error_page 401 =302 $scheme://{AUTHSERVER_NAME}/?redirect=$scheme://$host$request_uri;
+            try_files \"\" @success;
+        }
+
+        location @success {
+	    return 200 '<div id=\"page\">{PAGE_CONTENT}</div>';
+        }
+
+        location = /authenticate {
+	    internal;
+	    proxy_set_header X-Original-Url $scheme://$host$request_uri;
+	    proxy_pass http://authserver{URL_PREFIX}authenticate;
+        }
+    }";
 
 const DEFAULT_SELENIUM_VIDEO_GID: u32 = 1201;
-
-enum Expect {
-    Failure,
-    Success,
-}
 
 struct TestClient {
     #[allow(dead_code)]
     containers: Vec<ContainerAsync<GenericImage>>,
     video_container_id: String,
-    config: Config,
-    client: Client,
-    passwall_url: Url,
     selenium_url: Url,
-    nginx_url: Url,
-    jar: Arc<Jar>,
-    session: Option<String>,
+}
+
+struct NginxConf {
+    config: Config,
+    authserver_host: String,
+    authserver_name: String,
+    servers: Vec<String>,
+}
+
+impl NginxConf {
+    fn new(config: Config, authserver_name: String, server_names: &[&str]) -> Self {
+        let servers = server_names.iter().map(|s| s.to_string()).collect();
+        let authserver_host = format!("{}:{}", DEFAULT_PASSWALL_HOSTNAME, passwall::DEFAULT_PORT);
+        Self {
+            config,
+            authserver_host,
+            authserver_name,
+            servers,
+        }
+    }
+
+    fn to_string(&self) -> String {
+        let conf = DEFAULT_NGINX_CONF_TEMPLATE
+            .replace("{AUTHSERVER_HOST}", &self.authserver_host)
+            .replace("{AUTHSERVER_NAME}", &self.authserver_name)
+            .replace("{URL_PREFIX}", self.config.server.url_prefix());
+        let mut body = String::new();
+        for server_name in self.servers.iter() {
+            body.push_str(
+                DEFAULT_NGINX_CONF_SERVER_TEMPLATE
+                    .replace("{SERVER_NAME}", &server_name)
+                    .replace("{AUTHSERVER_NAME}", &self.authserver_name)
+                    .replace("{URL_PREFIX}", self.config.server.url_prefix())
+                    .replace("{PAGE_CONTENT}", &server_name)
+                    .as_ref(),
+            );
+        }
+        return conf.replace("{BODY}", &body);
+    }
 }
 
 impl TestClient {
     fn new(
-        config: Config,
         containers: Vec<ContainerAsync<GenericImage>>,
         video_container_id: String,
-        client: Client,
-        jar: Arc<Jar>,
-        passwall_url: Url,
         selenium_url: Url,
-        nginx_url: Url,
     ) -> Self {
         Self {
             video_container_id,
-            session: None,
-            config,
             containers,
-            client,
-            jar,
-            passwall_url,
             selenium_url,
-            nginx_url,
         }
-    }
-
-    fn get(&self, path: &str) -> RequestBuilder {
-        return self.client.get(self.passwall_url.join(path).unwrap());
-    }
-
-    fn post(&self, path: &str) -> RequestBuilder {
-        return self.client.post(self.passwall_url.join(path).unwrap());
-    }
-
-    async fn signin(
-        &mut self,
-        expect: Expect,
-        host: &str,
-        user: &str,
-        password: &str,
-    ) -> anyhow::Result<reqwest::Response> {
-        let target = format!("http://{}/", host);
-        assert_eq!(
-            self.get("/")
-                .query(&[("redirect", &target)])
-                .send()
-                .await?
-                .status(),
-            StatusCode::OK,
-        );
-
-        let cookie = self.jar.cookies(&self.passwall_url);
-        assert!(cookie.is_some());
-        assert!(
-            cookie
-                .unwrap()
-                .to_str()?
-                .contains(&format!("{}=", self.config.server.session.cookie_name))
-        );
-
-        let resp = self
-            .post("/signin")
-            .form(&[("name", user), ("password", password)])
-            .send()
-            .await?;
-
-        match &expect {
-            Expect::Success => {
-                assert_eq!(
-                    resp.status(),
-                    StatusCode::FOUND,
-                    "expected success, host: {}",
-                    host
-                );
-                assert_eq!(resp.headers().get("location").unwrap().to_str()?, &target);
-
-                // reqwest won't keep cookie because of domain mismatch, so we do the dirty job
-                let session_cookies = resp.headers().get_all("set-cookie");
-                for acl in &self.config.acl {
-                    let mut found = false;
-                    for session_cookie in &session_cookies {
-                        if let Some(cookie) = session_cookie
-                            .to_str()
-                            .ok()
-                            .and_then(|cookie| cookie::Cookie::parse(cookie).ok())
-                        {
-                            let domain = cookie.domain().unwrap();
-                            if acl.domain == domain {
-                                self.session = Some(cookie.value().to_string());
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    assert!(found == true, "missing domain in cookie: {}", acl.domain);
-                }
-
-                return Ok(resp);
-            }
-            Expect::Failure => {
-                assert_eq!(
-                    resp.status(),
-                    StatusCode::UNAUTHORIZED,
-                    "expected failure, host: {}",
-                    host
-                );
-            }
-        }
-
-        return Ok(resp);
-    }
-
-    async fn check_proxy_auth(&self, expect: Expect, host: &str) -> anyhow::Result<()> {
-        let resp = self
-            .get("/authenticate")
-            .header("host", host)
-            .header(
-                "cookie",
-                format!(
-                    "{}={}",
-                    self.config.server.session.cookie_name,
-                    self.session.clone().unwrap(),
-                ),
-            )
-            .send()
-            .await?;
-
-        match expect {
-            Expect::Success => {
-                assert_eq!(resp.status(), StatusCode::OK);
-            }
-            Expect::Failure => {
-                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-            }
-        };
-
-        Ok(())
     }
 }
 
@@ -246,22 +201,6 @@ fn new_user(name: &str, password: &str) -> User {
             .serialize()
             .to_string(),
     }
-}
-
-fn default_config() -> Config {
-    let mut config = Config::default();
-    config.users = Vec::from_iter([new_user(DEFAULT_USER, DEFAULT_PASSWORD)]);
-    config.acl = Vec::from_iter([DomainAclConfig {
-        domain: String::from(DEFAULT_HOST),
-        port: 80,
-        cookie: HostCookieConfig {
-            same_site: SimpleSameSite::strict,
-            domain: None,
-        },
-        allowed_users: vec![String::from(DEFAULT_USER)],
-    }]);
-
-    return config;
 }
 
 async fn get_bridge_ip_address(
@@ -321,7 +260,7 @@ async fn get_bridge_ip_address(
     ));
 }
 
-async fn build_client(config: &Config) -> color_eyre::Result<TestClient> {
+async fn build_client(config: &Config, nginx: &NginxConf) -> color_eyre::Result<TestClient> {
     // try to use whatever is in "DOCKER_HOST" environment, or docker by default.
     // otherwise, try podman
     let docker_socket = std::env::var("DOCKER_HOST").unwrap_or("/var/run/docker.sock".into());
@@ -377,16 +316,6 @@ async fn build_client(config: &Config) -> color_eyre::Result<TestClient> {
         };
     }
 
-    // let mut rng = rand::rng();
-    // let mut bytes = [0u8; 6];
-    // rng.fill(&mut bytes);
-    // let mut buf = Vec::with_capacity(12);
-    // for b in bytes.iter() {
-    //     write!(&mut buf, "{:02x}", b)?;
-    // }
-    //
-    // let random_id = String::from_utf8(buf)?;
-
     let auth_container_port = SocketAddr::from_str(&config.server.bind)?.port();
     let auth_container = GenericImage::new("docker.io/debian", "trixie-slim")
         .with_exposed_port(auth_container_port.tcp())
@@ -396,64 +325,55 @@ async fn build_client(config: &Config) -> color_eyre::Result<TestClient> {
         .with_copy_to("/passwall.yaml", config_path)
         .with_copy_to("/pass-wall", Path::new("./target/debug/pass-wall"))
         .with_ready_conditions(vec![WaitFor::message_on_stdout("starting listener")])
-        // .with_container_name(format!("passwall-{}", random_id))
         .with_network(&net_config.name)
         .start()
         .await?;
 
-    let auth_host = auth_container.get_host().await?;
-    let auth_port = auth_container
-        .get_host_port_ipv4(auth_container_port)
-        .await?;
+    let config_path = tmpdir.path().join("nginx.conf");
+    std::fs::write(&config_path, nginx.to_string())?;
 
-    let nginx_container = GenericImage::new("docker.io/nginx", "1.28.2")
+    let nginx_container = GenericImage::new("docker.io/nginx", "1.31.9")
         .with_exposed_port(80.into())
         .with_host(
-            "passwall",
+            DEFAULT_PASSWALL_HOSTNAME,
             testcontainers::core::Host::Addr(
                 get_bridge_ip_address(&cli, &auth_container, &net_config.name).await?,
             ),
         )
-        .with_copy_to("/etc/nginx/nginx.conf", Path::new("./tests/nginx.conf"))
+        .with_copy_to("/etc/nginx/nginx.conf", config_path)
         .with_ready_conditions(vec![WaitFor::message_on_stderr("start worker processes")])
-        // .with_container_name(format!("nginx-{}", random_id))
         .with_network(&net_config.name)
         .start()
         .await?;
 
-    let nginx_host = nginx_container.get_host().await?;
-    let nginx_port = nginx_container.get_host_port_ipv4(80).await?;
-
-    let jar = Arc::new(Jar::default());
-    let client = reqwest::Client::builder()
-        .cookie_provider(jar.clone())
-        .redirect(RedirectPolicy::none())
-        .build()?;
+    let hub_container = GenericImage::new("docker.io/selenium/hub", "4.52")
+        .with_exposed_port(4444.into())
+        .with_ready_conditions(vec![WaitFor::message_on_stdout("Started Selenium Hub")])
+        .with_network(&net_config.name)
+        .start()
+        .await?;
 
     let nginx_ip = get_bridge_ip_address(&cli, &nginx_container, &net_config.name).await?;
-    let selenium_container = GenericImage::new("docker.io/selenium/node-chromium", "145.0")
+    let hub_ip = get_bridge_ip_address(&cli, &hub_container, &net_config.name).await?;
+    let mut selenium_cr = GenericImage::new("docker.io/selenium/node-chromium", "156.0")
+        .with_exposed_port(7900.into())
         .with_host(
-            "sub-a.example.com",
+            &nginx.authserver_name,
             testcontainers::core::Host::Addr(nginx_ip),
-        )
-        .with_host(
-            "sub-b.example.com",
-            testcontainers::core::Host::Addr(nginx_ip),
-        )
-        .with_host(
-            "sub-c.example.com",
-            testcontainers::core::Host::Addr(nginx_ip),
-        )
-        .with_host(
-            "auth.example.com",
-            testcontainers::core::Host::Addr(nginx_ip),
-        )
+        );
+
+    for server_name in nginx.servers.iter() {
+        selenium_cr =
+            selenium_cr.with_host(server_name, testcontainers::core::Host::Addr(nginx_ip));
+    }
+
+    let selenium_container = selenium_cr
+        .with_host("hub", testcontainers::core::Host::Addr(hub_ip))
         .with_env_var("SE_EVENT_BUS_HOST", "hub")
         .with_env_var("SE_EVENT_BUS_PUBLISH_PORT", "4442")
         .with_env_var("SE_EVENT_BUS_SUBSCRIBE_PORT", "4443")
         .with_shm_size(2048 * 1024) // 2G
         .with_ready_conditions([WaitFor::message_on_stdout("Started Selenium node")].into())
-        // .with_container_name(format!("chromium-{}", random_id))
         .with_network(&net_config.name)
         .start()
         .await?;
@@ -488,7 +408,7 @@ async fn build_client(config: &Config) -> color_eyre::Result<TestClient> {
             return color_eyre::eyre::eyre!("missing selenium container name");
         })?;
 
-    let video_container = GenericImage::new("docker.io/selenium/video", "ffmpeg-8.0-20260222")
+    let video_container = GenericImage::new("docker.io/selenium/video", "ffmpeg-8.1-20261101")
         .with_mount(Mount::bind_mount(videos_dir, "/videos"))
         .with_env_var(
             "DISPLAY_CONTAINER_NAME",
@@ -500,24 +420,23 @@ async fn build_client(config: &Config) -> color_eyre::Result<TestClient> {
         .start()
         .await?;
 
+    let hub_host = hub_container.get_host().await?;
+    let hub_port = hub_container.get_host_port_ipv4(4444).await?;
+
     let video_container_id = video_container.id().to_string();
     let http = TestClient::new(
-        config.clone(),
         [
             auth_container,
             nginx_container,
-            // hub_container,
+            hub_container,
             video_container,
             selenium_container,
         ]
         .into(),
         video_container_id,
-        client,
-        jar.clone(),
-        Url::parse(&format!("http://{auth_host}:{auth_port}"))?,
-        Url::parse(&format!("http://127.0.0.1:4444"))?,
-        Url::parse(&format!("http://{nginx_host}:{nginx_port}"))?,
+        Url::parse(&format!("http://{hub_host}:{hub_port}"))?,
     );
+
     return Ok(http);
 }
 
@@ -564,51 +483,33 @@ async fn wait_for_url_match_host(
     }
 }
 
-// main test scenarios:
-// 1. single subdomain, cookie is per subdomain
-// 2. multiple subdomains, cookie works for all subdomains of that domain
-// 2. single domain, cookie works only for that domain, not for subdomains
-#[tokio::test(flavor = "multi_thread")]
-async fn test_authorizes_subdomain() -> color_eyre::Result<()> {
-    let _ = color_eyre::install();
+async fn wait_for_url_not_match_host(
+    driver: &WebDriver,
+    host: &str,
+    timeout: tokio::time::Duration,
+) -> WebDriverResult<()> {
+    let start = std::time::Instant::now();
 
-    let mut config = Config::default();
-    config.users.push(new_user(DEFAULT_USER, DEFAULT_PASSWORD));
-    config.server.url_prefix = Some("/passwall/".into());
-    config.server.scheme_https = false;
-    config.acl.push(DomainAclConfig {
-        domain: "sub-c.example.com".into(),
-        port: 80,
-        allowed_users: vec![DEFAULT_USER.into()],
-        cookie: HostCookieConfig {
-            same_site: SimpleSameSite::strict,
-            domain: None,
-        },
-    });
+    loop {
+        let url = driver.current_url().await?;
+        if url.host_str() == Some(host) {
+            return Err(WebDriverError::Timeout("url matched host".into()));
+        }
 
-    let client = build_client(&config).await?;
-    let server_url = client.selenium_url.to_string();
+        if start.elapsed() > timeout {
+            return Ok(());
+        }
 
-    let mut caps = DesiredCapabilities::chrome();
-    caps.insert_base_capability("se:name".into(), "test_authorizes_subdomain".into());
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    }
+}
 
-    let driver = WebDriver::new(&server_url, caps).await?;
-    driver.goto("http://sub-c.example.com").await?;
-
-    let _ = wait_for_input_filled(&driver, "csrf_token", tokio::time::Duration::from_secs(2)).await;
-
-    wait_for_url_match_host(
-        &driver,
-        "sub-c.example.com",
-        tokio::time::Duration::from_secs(5),
-    )
-    .await?;
-
+async fn signin(driver: &WebDriver, user: &str, password: &str) -> color_eyre::Result<()> {
     let name_form = driver.query(By::Id("name")).first().await?;
-    name_form.send_keys(DEFAULT_USER).await?;
+    name_form.send_keys(user).await?;
 
     let password_form = driver.query(By::Id("password")).first().await?;
-    password_form.send_keys(DEFAULT_PASSWORD).await?;
+    password_form.send_keys(password).await?;
 
     let elem_button = driver
         .query(By::Css("button[type='submit']"))
@@ -616,9 +517,98 @@ async fn test_authorizes_subdomain() -> color_eyre::Result<()> {
         .await?;
     elem_button.click().await?;
 
+    return Ok(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_authorizes_one_domain() -> color_eyre::Result<()> {
+    let _ = color_eyre::install();
+
+    let mut config = Config::default();
+    config.users.push(new_user(DEFAULT_USER, DEFAULT_PASSWORD));
+    config.server.scheme_https = false;
+    config.acl.push(DomainAclConfig {
+        domain: "example.com".into(),
+        port: 80,
+        allowed_users: vec![DEFAULT_USER.into()],
+        cookie: HostCookieConfig {
+            same_site: SimpleSameSite::lax,
+            domain: Some("example.com".into()),
+        },
+    });
+
+    let nginx = NginxConf::new(config.clone(), "auth.example.com".into(), &["example.com"]);
+
+    let client = build_client(&config, &nginx).await?;
+    let server_url = client.selenium_url.to_string();
+
+    let caps = DesiredCapabilities::chrome();
+
+    let driver = WebDriver::new(&server_url, caps).await?;
+    driver.goto("http://example.com").await?;
+
+    let _ = wait_for_input_filled(&driver, "csrf_token", tokio::time::Duration::from_secs(2)).await;
+
+    wait_for_url_match_host(
+        &driver,
+        "auth.example.com",
+        tokio::time::Duration::from_secs(5),
+    )
+    .await?;
+
+    signin(&driver, DEFAULT_USER, DEFAULT_PASSWORD).await?;
+
     let elem = driver.query(By::Id("page")).first().await?;
     let page = elem.text().await?;
-    assert_eq!(page, "sub-c");
+    assert_eq!(page, "example.com");
+
+    driver.quit().await?;
+    return Ok(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_server_url_prefix() -> color_eyre::Result<()> {
+    let _ = color_eyre::install();
+
+    let mut config = Config::default();
+    config.users.push(new_user(DEFAULT_USER, DEFAULT_PASSWORD));
+    config.server.scheme_https = false;
+    config.server.url_prefix = Some("/prefix/".into());
+    config.acl.push(DomainAclConfig {
+        domain: "example.com".into(),
+        port: 80,
+        allowed_users: vec![DEFAULT_USER.into()],
+        cookie: HostCookieConfig {
+            same_site: SimpleSameSite::lax,
+            domain: Some("example.com".into()),
+        },
+    });
+
+    let nginx = NginxConf::new(config.clone(), "auth.example.com".into(), &["example.com"]);
+
+    let client = build_client(&config, &nginx).await?;
+
+    let server_url = client.selenium_url.to_string();
+
+    let caps = DesiredCapabilities::chrome();
+
+    let driver = WebDriver::new(&server_url, caps).await?;
+    driver.goto("http://example.com").await?;
+
+    let _ = wait_for_input_filled(&driver, "csrf_token", tokio::time::Duration::from_secs(2)).await;
+
+    wait_for_url_match_host(
+        &driver,
+        "auth.example.com",
+        tokio::time::Duration::from_secs(5),
+    )
+    .await?;
+
+    signin(&driver, DEFAULT_USER, DEFAULT_PASSWORD).await?;
+
+    let elem = driver.query(By::Id("page")).first().await?;
+    let page = elem.text().await?;
+    assert_eq!(page, "example.com");
 
     driver.quit().await?;
     return Ok(());
@@ -652,14 +642,16 @@ async fn test_authorizes_multiple_subdomains_access_all() -> color_eyre::Result<
         },
     ]);
 
-    let client = build_client(&config).await?;
+    let nginx = NginxConf::new(
+        config.clone(),
+        "auth.example.com".into(),
+        &["sub-a.example.com", "sub-b.example.com"],
+    );
+
+    let client = build_client(&config, &nginx).await?;
     let server_url = client.selenium_url.to_string();
 
-    let mut caps = DesiredCapabilities::chrome();
-    caps.insert_base_capability(
-        "se:name".into(),
-        "test_authorizes_multiple_subdomains_access_all".into(),
-    );
+    let caps = DesiredCapabilities::chrome();
 
     let driver = WebDriver::new(&server_url, caps).await?;
     driver.goto("http://sub-a.example.com").await?;
@@ -673,132 +665,228 @@ async fn test_authorizes_multiple_subdomains_access_all() -> color_eyre::Result<
     )
     .await?;
 
-    let name_form = driver.query(By::Id("name")).first().await?;
-    name_form.send_keys(DEFAULT_USER).await?;
-
-    let password_form = driver.query(By::Id("password")).first().await?;
-    password_form.send_keys(DEFAULT_PASSWORD).await?;
-
-    let elem_button = driver
-        .query(By::Css("button[type='submit']"))
-        .first()
-        .await?;
-    elem_button.click().await?;
+    signin(&driver, DEFAULT_USER, DEFAULT_PASSWORD).await?;
 
     let elem = driver.query(By::Id("page")).first().await?;
     let page = elem.text().await?;
-    assert_eq!(page, "sub-a");
+    assert_eq!(page, "sub-a.example.com");
 
     driver.goto("http://sub-b.example.com").await?;
+
+    wait_for_url_match_host(
+        &driver,
+        "sub-b.example.com",
+        tokio::time::Duration::from_secs(5),
+    )
+    .await?;
+
     let elem = driver.query(By::Id("page")).first().await?;
     let page = elem.text().await?;
-    assert_eq!(page, "sub-b");
+    assert_eq!(page, "sub-b.example.com");
 
     driver.quit().await?;
     return Ok(());
 }
 
-// #[tokio::test]
-// async fn test_authorizes_user() -> anyhow::Result<()> {
-//     let config = default_config();
-//     let mut client = build_client(&config).await?;
-//     client
-//         .signin(
-//             Expect::Success,
-//             DEFAULT_HOST,
-//             DEFAULT_USER,
-//             DEFAULT_PASSWORD,
-//         )
-//         .await?;
-//
-//     client
-//         .check_proxy_auth(Expect::Success, DEFAULT_HOST)
-//         .await?;
-//
-//     Ok(())
-// }
-//
-// #[tokio::test]
-// async fn test_rejects_invalid_password() -> anyhow::Result<()> {
-//     let config = default_config();
-//     let mut client = build_client(&config).await?;
-//
-//     client
-//         .signin(
-//             Expect::Failure,
-//             DEFAULT_HOST,
-//             DEFAULT_USER,
-//             &format!("{}{}", DEFAULT_PASSWORD, "notthepassword"),
-//         )
-//         .await?;
-//
-//     Ok(())
-// }
-//
-// #[tokio::test]
-// async fn test_rejects_invalid_credentials() -> anyhow::Result<()> {
-//     let config = default_config();
-//     let mut client = build_client(&config).await?;
-//     client
-//         .signin(
-//             Expect::Failure,
-//             DEFAULT_HOST,
-//             &format!("{}{}", DEFAULT_USER, "user123"),
-//             "notthepassword",
-//         )
-//         .await?;
-//
-//     Ok(())
-// }
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rejects_invalid_creds() -> color_eyre::Result<()> {
+    let _ = color_eyre::install();
 
-// #[tokio::test]
-// async fn test_authorizes_every_domain_for_user() -> anyhow::Result<()> {
-//     let mut config = default_config();
-//     config.acl.extend([
-//         DomainAclConfig {
-//             domain: "sub.other.com".into(),
-//             port: 80,
-//             allowed_users: Vec::from_iter([DEFAULT_USER.to_string()]),
-//             cookie: HostCookieConfig {
-//                 same_site: SimpleSameSite::strict,
-//                 domain: None,
-//             },
-//         },
-//         DomainAclConfig {
-//             domain: "another.com".into(),
-//             port: 80,
-//             allowed_users: Vec::from_iter([DEFAULT_USER.to_string()]),
-//             cookie: HostCookieConfig {
-//                 same_site: SimpleSameSite::strict,
-//                 domain: None,
-//             },
-//         },
-//     ]);
-//
-//     let mut client = build_client(&config).await?;
-//
-//     client
-//         .signin(
-//             Expect::Success,
-//             DEFAULT_DOMAIN,
-//             DEFAULT_USER,
-//             DEFAULT_PASSWORD,
-//         )
-//         .await?;
-//     Ok(())
-// }
-//
-// #[tokio::test]
-// async fn test_authorizes_and_ignores_host_header() -> anyhow::Result<()> {
-//     let config = default_config();
-//     let mut client = build_client(&config).await?;
-//     client
-//         .signin(
-//             Expect::Success,
-//             "notexists.com",
-//             DEFAULT_USER,
-//             DEFAULT_PASSWORD,
-//         )
-//         .await?;
-//     Ok(())
-// }
+    let mut config = Config::default();
+    config.users.push(new_user(DEFAULT_USER, DEFAULT_PASSWORD));
+    config.server.scheme_https = false;
+    config.acl.extend([DomainAclConfig {
+        domain: "example.com".into(),
+        port: 80,
+        allowed_users: vec![DEFAULT_USER.into()],
+        cookie: HostCookieConfig {
+            same_site: SimpleSameSite::lax,
+            domain: Some("example.com".into()),
+        },
+    }]);
+
+    let nginx = NginxConf::new(config.clone(), "auth.example.com".into(), &["example.com"]);
+
+    let client = build_client(&config, &nginx).await?;
+    let server_url = client.selenium_url.to_string();
+
+    let caps = DesiredCapabilities::chrome();
+
+    let driver = WebDriver::new(&server_url, caps).await?;
+    driver.goto("http://example.com").await?;
+
+    let _ = wait_for_input_filled(&driver, "csrf_token", tokio::time::Duration::from_secs(2)).await;
+
+    wait_for_url_match_host(
+        &driver,
+        "auth.example.com",
+        tokio::time::Duration::from_secs(5),
+    )
+    .await?;
+
+    signin(&driver, DEFAULT_USER, "not-the-password").await?;
+
+    wait_for_url_not_match_host(
+        &driver,
+        "example.com".into(),
+        tokio::time::Duration::from_secs(2),
+    )
+    .await?;
+
+    signin(&driver, "not-the-user", DEFAULT_PASSWORD).await?;
+
+    wait_for_url_not_match_host(
+        &driver,
+        "example.com".into(),
+        tokio::time::Duration::from_secs(2),
+    )
+    .await?;
+
+    let mut long_str = String::with_capacity(1024);
+    for _ in 0..1024 {
+        long_str.push('A');
+    }
+
+    signin(&driver, &long_str, DEFAULT_PASSWORD).await?;
+
+    wait_for_url_not_match_host(
+        &driver,
+        "example.com".into(),
+        tokio::time::Duration::from_secs(2),
+    )
+    .await?;
+
+    driver.goto("http://example.com").await?;
+
+    let _ = wait_for_input_filled(&driver, "csrf_token", tokio::time::Duration::from_secs(2)).await;
+
+    wait_for_url_match_host(
+        &driver,
+        "auth.example.com",
+        tokio::time::Duration::from_secs(5),
+    )
+    .await?;
+
+    signin(&driver, DEFAULT_USER, &long_str).await?;
+
+    wait_for_url_not_match_host(
+        &driver,
+        "example.com".into(),
+        tokio::time::Duration::from_secs(2),
+    )
+    .await?;
+
+    driver.goto("http://example.com").await?;
+
+    let _ = wait_for_input_filled(&driver, "csrf_token", tokio::time::Duration::from_secs(2)).await;
+
+    wait_for_url_match_host(
+        &driver,
+        "auth.example.com",
+        tokio::time::Duration::from_secs(5),
+    )
+    .await?;
+
+    signin(&driver, &long_str, &long_str).await?;
+
+    wait_for_url_not_match_host(
+        &driver,
+        "example.com".into(),
+        tokio::time::Duration::from_secs(2),
+    )
+    .await?;
+
+    driver.quit().await?;
+    return Ok(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rejects_unauthorized_user() -> color_eyre::Result<()> {
+    let _ = color_eyre::install();
+
+    let user_a = "user_a";
+    let user_b = "user_b";
+
+    let mut config = Config::default();
+    config.users.push(new_user(user_a, DEFAULT_PASSWORD));
+    config.users.push(new_user(user_b, DEFAULT_PASSWORD));
+    config.server.scheme_https = false;
+    config.acl.extend([
+        DomainAclConfig {
+            domain: "sub-a.example.com".into(),
+            port: 80,
+            allowed_users: vec![user_a.into()],
+            cookie: HostCookieConfig {
+                same_site: SimpleSameSite::lax,
+                domain: Some("example.com".into()),
+            },
+        },
+        DomainAclConfig {
+            domain: "sub-b.example.com".into(),
+            port: 80,
+            allowed_users: vec![user_b.into()],
+            cookie: HostCookieConfig {
+                same_site: SimpleSameSite::lax,
+                domain: Some("example.com".into()),
+            },
+        },
+    ]);
+
+    let nginx = NginxConf::new(
+        config.clone(),
+        "auth.example.com".into(),
+        &["sub-a.example.com", "sub-b.example.com"],
+    );
+
+    let client = build_client(&config, &nginx).await?;
+    let server_url = client.selenium_url.to_string();
+
+    let caps = DesiredCapabilities::chrome();
+
+    let driver = WebDriver::new(&server_url, caps).await?;
+    driver.goto("http://sub-a.example.com").await?;
+
+    let _ = wait_for_input_filled(&driver, "csrf_token", tokio::time::Duration::from_secs(2)).await;
+
+    wait_for_url_match_host(
+        &driver,
+        "auth.example.com",
+        tokio::time::Duration::from_secs(5),
+    )
+    .await?;
+
+    signin(&driver, user_b, DEFAULT_PASSWORD).await?;
+
+    wait_for_url_not_match_host(
+        &driver,
+        "sub-a.example.com".into(),
+        tokio::time::Duration::from_secs(2),
+    )
+    .await?;
+
+    driver.delete_all_cookies().await?;
+
+    driver.goto("http://sub-b.example.com").await?;
+
+    let _ = wait_for_input_filled(&driver, "csrf_token", tokio::time::Duration::from_secs(2)).await;
+
+    wait_for_url_match_host(
+        &driver,
+        "auth.example.com",
+        tokio::time::Duration::from_secs(5),
+    )
+    .await?;
+
+    signin(&driver, user_a, DEFAULT_PASSWORD).await?;
+
+    wait_for_url_not_match_host(
+        &driver,
+        "sub-b.example.com".into(),
+        tokio::time::Duration::from_secs(2),
+    )
+    .await?;
+
+    driver.quit().await?;
+
+    return Ok(());
+}
