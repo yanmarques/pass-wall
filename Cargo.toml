@@ -35,7 +35,7 @@ tempfile = "3.23.0"
 testcontainers = "0.25.0"
 tokio = { version = "1.49.0", default-features = false, features = ["test-util", "process", "rt-multi-thread", "macros"] }
 tower = "0.5.3"
-thirtyfour = { version = "0.36.1" }
+thirtyfour = { version = "0.37.10" }
 color-eyre = "0.6"
 futures-util = "0.3.32"
 
